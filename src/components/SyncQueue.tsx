@@ -1,17 +1,42 @@
 import React, { useState } from 'react';
 import { motion } from 'motion/react';
-import { RefreshCw, AlertTriangle, XCircle, CheckCircle2, Clock, ChevronDown, ChevronUp } from 'lucide-react';
-import { useQuery, useMutation } from "convex/react";
+import { RefreshCw, AlertTriangle, XCircle, CheckCircle2, Clock, ChevronDown, ChevronUp, Loader2 } from 'lucide-react';
+import { useAction, useQuery, useMutation } from "convex/react";
 import { api } from "../../convex/_generated/api";
 
 export default function SyncQueue() {
   const jobs = useQuery(api.sync.getSyncJobs);
   const retryJob = useMutation(api.sync.retrySyncJob);
+  const processPendingSyncJobs = useAction(api.syncProcessor.processPendingSyncJobs);
   const [filter, setFilter] = useState<string>('all');
   const [expandedJob, setExpandedJob] = useState<string | null>(null);
+  const [isRunningSync, setIsRunningSync] = useState(false);
+  const [runMessage, setRunMessage] = useState<string | null>(null);
+  const [runError, setRunError] = useState<string | null>(null);
 
   const handleRetry = async (id: any) => {
     await retryJob({ id });
+  };
+
+  const handleRunPendingSyncs = async () => {
+    setIsRunningSync(true);
+    setRunMessage(null);
+    setRunError(null);
+
+    try {
+      const result = await processPendingSyncJobs({ limit: 10 });
+      if (result.skipped) {
+        setRunError(result.reason);
+      } else if (result.processed === 0) {
+        setRunMessage('No pending sync jobs were available.');
+      } else {
+        setRunMessage(`Processed ${result.processed} job(s): ${result.succeeded} succeeded, ${result.failed} failed.`);
+      }
+    } catch (err: any) {
+      setRunError(err.message || 'Failed to process sync queue.');
+    } finally {
+      setIsRunningSync(false);
+    }
   };
 
   const filteredJobs = filter === 'all' ? (jobs || []) : (jobs || []).filter(j => j.status === filter);
@@ -36,14 +61,21 @@ export default function SyncQueue() {
       return (
         <div className="space-y-1">
           {keys.map(key => {
-            const change = changes[key];
+            const change = changes[key] as any;
+            const isDiffObject = change && typeof change === 'object' && ('old' in change || 'new' in change);
             return (
               <div key={key} className="text-xs">
                 <span className="font-semibold text-zinc-700">{key}: </span>
-                {change.old !== undefined && (
-                  <span className="text-red-500 line-through mr-1">{String(change.old)}</span>
+                {isDiffObject ? (
+                  <>
+                    {change.old !== undefined && (
+                      <span className="text-red-500 line-through mr-1">{String(change.old)}</span>
+                    )}
+                    <span className="text-emerald-600">{String(change.new)}</span>
+                  </>
+                ) : (
+                  <span className="text-zinc-600">{typeof change === 'string' ? change : JSON.stringify(change)}</span>
                 )}
-                <span className="text-emerald-600">{String(change.new)}</span>
               </div>
             );
           })}
@@ -60,21 +92,49 @@ export default function SyncQueue() {
       animate={{ opacity: 1 }}
       className="max-w-7xl mx-auto space-y-6"
     >
-      <div className="flex gap-2">
-        {['all', 'pending', 'processing', 'success', 'failed', 'dead'].map(f => (
+      <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+        <div className="flex flex-wrap gap-2">
+          {['all', 'pending', 'processing', 'success', 'failed', 'dead'].map(f => (
+            <button
+              key={f}
+              onClick={() => setFilter(f)}
+              className={`px-4 py-2 rounded-lg text-sm font-medium capitalize transition-colors ${
+                filter === f 
+                  ? 'bg-zinc-900 text-white' 
+                  : 'bg-white border border-zinc-200 text-zinc-600 hover:bg-zinc-50'
+              }`}
+            >
+              {f}
+            </button>
+          ))}
+        </div>
+
+        <div className="flex flex-col items-start gap-2 lg:items-end">
+          <div className="text-xs text-zinc-500">
+            Queue processing is scheduled every 60 seconds through Convex cron.
+          </div>
           <button
-            key={f}
-            onClick={() => setFilter(f)}
-            className={`px-4 py-2 rounded-lg text-sm font-medium capitalize transition-colors ${
-              filter === f 
-                ? 'bg-zinc-900 text-white' 
-                : 'bg-white border border-zinc-200 text-zinc-600 hover:bg-zinc-50'
-            }`}
+            onClick={handleRunPendingSyncs}
+            disabled={isRunningSync}
+            className="flex items-center gap-2 px-4 py-2 bg-zinc-900 text-white rounded-lg text-sm font-medium hover:bg-zinc-800 disabled:opacity-50 transition-colors"
           >
-            {f}
+            {isRunningSync ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
+            {isRunningSync ? 'Running Sync...' : 'Run Pending Syncs'}
           </button>
-        ))}
+        </div>
       </div>
+
+      {runMessage && (
+        <div className="bg-emerald-50 border border-emerald-200 text-emerald-700 rounded-xl px-4 py-3 text-sm">
+          {runMessage}
+        </div>
+      )}
+
+      {runError && (
+        <div className="bg-red-50 border border-red-200 text-red-700 rounded-xl px-4 py-3 text-sm">
+          {runError}
+        </div>
+      )}
 
       <div className="bg-white rounded-xl shadow-sm border border-zinc-200 overflow-hidden">
         <div className="overflow-x-auto">

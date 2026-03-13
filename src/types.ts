@@ -1,13 +1,13 @@
 export interface Product {
   id: string;
-  external_product_id: string | null;
+  external_product_id?: string | null;
   name: string;
-  description: string | null;
-  brand: string | null;
+  description?: string | null;
+  brand?: string | null;
   status: string;
   is_visible: number;
   default_price: number | null;
-  version: number;
+  version?: number;
   sync_needed: number;
   updated_at: string;
   created_at: string;
@@ -15,7 +15,8 @@ export interface Product {
 }
 
 export interface Variant {
-  id: string;
+  id?: string;
+  _id?: string;
   product_id: string;
   sku: string;
   price: number;

@@ -1,5 +1,69 @@
 import { mutation, query, internalMutation } from "./_generated/server";
+import type { Doc, Id } from "./_generated/dataModel";
 import { v } from "convex/values";
+
+type ProductRecord = Doc<"products">;
+type VariantRecord = Doc<"variants">;
+
+function readString(value: unknown): string | undefined {
+  if (value === null || value === undefined) {
+    return undefined;
+  }
+
+  const trimmed = String(value).trim();
+  return trimmed ? trimmed : undefined;
+}
+
+function getProductSyncIdentifier(product: ProductRecord): string {
+  return product.external_product_id || product._id;
+}
+
+async function getProductByStoredIdentifier(ctx: any, identifier: string): Promise<ProductRecord | null> {
+  let product = await ctx.db.query("products").withIndex("by_external_id", (q: any) => q.eq("external_product_id", identifier)).first();
+  if (!product) {
+    try {
+      product = await ctx.db.get(identifier as Id<"products">);
+    } catch {
+      product = null;
+    }
+  }
+
+  return product;
+}
+
+async function getProductForImport(
+  ctx: any,
+  externalId: string | undefined,
+  sku: string | undefined,
+): Promise<ProductRecord | null> {
+  if (externalId) {
+    const product = await ctx.db.query("products").withIndex("by_external_id", (q: any) => q.eq("external_product_id", externalId)).first();
+    if (product) {
+      return product;
+    }
+  }
+
+  if (!sku) {
+    return null;
+  }
+
+  const variant = await ctx.db.query("variants").withIndex("by_sku", (q: any) => q.eq("sku", sku)).first();
+  if (!variant) {
+    return null;
+  }
+
+  return await getProductByStoredIdentifier(ctx, variant.product_id);
+}
+
+async function getVariantsForProduct(ctx: any, identifiers: string[]): Promise<VariantRecord[]> {
+  const groups = await Promise.all(
+    identifiers.map((identifier) =>
+      ctx.db.query("variants").withIndex("by_product", (q: any) => q.eq("product_id", identifier)).collect(),
+    ),
+  );
+
+  return [...new Map(groups.flat().map((variant) => [variant._id, variant])).values()];
+}
 
 export const getImports = query({
   args: {},
@@ -26,35 +90,31 @@ export const processRecords = internalMutation({
       const itemType = record['Item Type'];
       if (itemType !== 'Product') continue;
 
-      const externalId = record['Product ID'];
-      if (!externalId) {
+      const externalId = readString(record['Product ID']);
+      if (args.importType === 'delete' && !externalId) {
         invalidCount++;
         errors.push({ row: rowIndex, error: 'Missing Product ID', data: record });
         continue;
       }
 
-      const id = externalId;
-
       if (args.importType === 'delete') {
         try {
-          const product = await ctx.db.query("products").withIndex("by_external_id", q => q.eq("external_product_id", id)).first();
+          const product = await ctx.db.query("products").withIndex("by_external_id", q => q.eq("external_product_id", externalId!)).first();
           if (!product) {
             invalidCount++;
             errors.push({ row: rowIndex, error: 'Product not found in local database', data: record });
             continue;
           }
 
-          // Delete variants
-          const variants = await ctx.db.query("variants").withIndex("by_product", q => q.eq("product_id", id)).collect();
+          const productIdentifiers = [...new Set([product._id, product.external_product_id].filter((value): value is string => !!value))];
+          const variants = await getVariantsForProduct(ctx, productIdentifiers);
           for (const v of variants) await ctx.db.delete(v._id);
           
-          // Delete product
           await ctx.db.delete(product._id);
 
-          // Queue sync
           await ctx.db.insert("sync_queue", {
             entity_type: "product",
-            internal_id: id,
+            internal_id: externalId!,
             action: "delete",
             status: "pending",
             attempts: 0,
@@ -70,26 +130,26 @@ export const processRecords = internalMutation({
         continue;
       }
 
-      // Update logic
-      const name = record['Name'];
+      const name = readString(record['Name']);
       if (!name) {
         invalidCount++;
         errors.push({ row: rowIndex, error: 'Missing Name', data: record });
         continue;
       }
 
-      const description = record['Description'] || null;
-      const brand = record['Brand'] || null;
+      const description = readString(record['Description']);
+      const brand = readString(record['Brand']);
       const isVisible = parseInt(record['Product Visible']) === 1 ? 1 : 0;
       const status = isVisible ? 'active' : 'inactive';
       const price = parseFloat(record['Price']) || 0;
-      const sku = record['Code'];
+      const sku = readString(record['Code']);
       const inventoryLevel = parseInt(record['Stock Level']) || 0;
 
       try {
-        let product = await ctx.db.query("products").withIndex("by_external_id", q => q.eq("external_product_id", id)).first();
+        let product = await getProductForImport(ctx, externalId, sku);
         const productChanges: Record<string, any> = {};
         let productAction = 'create';
+        let productIdentifier: string;
 
         if (product) {
           productAction = 'update';
@@ -104,6 +164,7 @@ export const processRecords = internalMutation({
             name, description, brand, status, is_visible: isVisible, default_price: price,
             sync_needed: 1, updated_at: new Date().toISOString()
           });
+          productIdentifier = getProductSyncIdentifier(product);
         } else {
           productChanges.name = { new: name };
           productChanges.description = { new: description };
@@ -112,17 +173,22 @@ export const processRecords = internalMutation({
           productChanges.is_visible = { new: isVisible };
           productChanges.default_price = { new: price };
 
-          await ctx.db.insert("products", {
-            external_product_id: id,
+          const productId = await ctx.db.insert("products", {
+            ...(externalId ? { external_product_id: externalId } : {}),
             name, description, brand, status, is_visible: isVisible, default_price: price,
             sync_needed: 1, created_at: new Date().toISOString(), updated_at: new Date().toISOString()
           });
+          product = await ctx.db.get(productId);
+          if (!product) {
+            throw new Error('Created product could not be reloaded');
+          }
+          productIdentifier = externalId || productId;
         }
 
         if (Object.keys(productChanges).length > 0) {
           await ctx.db.insert("sync_queue", {
             entity_type: "product",
-            internal_id: id,
+            internal_id: productIdentifier,
             action: productAction,
             status: "pending",
             attempts: 0,
@@ -139,18 +205,21 @@ export const processRecords = internalMutation({
 
           if (variant) {
             variantAction = 'update';
+            if (variant.product_id !== productIdentifier) {
+              throw new Error(`SKU ${sku} is already linked to another product.`);
+            }
             if (variant.price !== price) variantChanges.price = { old: variant.price, new: price };
             if (variant.inventory_level !== inventoryLevel) variantChanges.inventory_level = { old: variant.inventory_level, new: inventoryLevel };
             
             await ctx.db.patch(variant._id, {
-              price, inventory_level: inventoryLevel, sync_needed: 1, updated_at: new Date().toISOString()
+              product_id: productIdentifier, price, inventory_level: inventoryLevel, sync_needed: 1, updated_at: new Date().toISOString()
             });
           } else {
             variantChanges.price = { new: price };
             variantChanges.inventory_level = { new: inventoryLevel };
 
             await ctx.db.insert("variants", {
-              product_id: id,
+              product_id: productIdentifier,
               sku, price, inventory_level: inventoryLevel, sync_needed: 1,
               created_at: new Date().toISOString(), updated_at: new Date().toISOString()
             });

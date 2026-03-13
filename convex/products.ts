@@ -1,4 +1,5 @@
 import { query, mutation } from "./_generated/server";
+import type { Id } from "./_generated/dataModel";
 import { v } from "convex/values";
 
 export const getDashboardStats = query({
@@ -22,7 +23,7 @@ export const getDashboardStats = query({
 export const getProducts = query({
   args: {},
   handler: async (ctx) => {
-    const products = await ctx.db.query("products").order("desc").take(50);
+    const products = await ctx.db.query("products").order("desc").collect();
     const variants = await ctx.db.query("variants").collect();
     
     return products.map(p => ({
@@ -51,7 +52,7 @@ export const updateProduct = mutation({
     if (!product) {
       // Try by _id if it's a valid Convex ID
       try {
-        product = await ctx.db.get(id as any);
+        product = await ctx.db.get(id as Id<"products">);
       } catch (e) {
         // Ignore invalid ID error
       }
@@ -103,7 +104,7 @@ export const deleteProduct = mutation({
     let product = await ctx.db.query("products").withIndex("by_external_id", q => q.eq("external_product_id", id)).first();
     if (!product) {
       try {
-        product = await ctx.db.get(id as any);
+        product = await ctx.db.get(id as Id<"products">);
       } catch (e) {}
     }
     

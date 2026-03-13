@@ -9,11 +9,12 @@ export default function Catalog() {
   const products = useQuery(api.products.getProducts);
   const updateProduct = useMutation(api.products.updateProduct);
   const deleteProduct = useMutation(api.products.deleteProduct);
-  const getCategoryUrl = useAction(api.bigcommerce.getCategoryUrl);
+  const getCategoryUrl = useAction((api.bigcommerce as any).getCategoryUrl);
   const pullFromBigCommerce = useAction(api.bigcommerce.pullFromBigCommerce);
 
   const [pulling, setPulling] = useState(false);
   const [pullError, setPullError] = useState<string | null>(null);
+  const [pullProgress, setPullProgress] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   
   const [editingProduct, setEditingProduct] = useState<Product | null>(null);
@@ -28,12 +29,30 @@ export default function Catalog() {
   const handlePullFromBigCommerce = async () => {
     setPulling(true);
     setPullError(null);
+    setPullProgress('Starting BigCommerce pull...');
     try {
-      const res = await pullFromBigCommerce();
-      alert(`Successfully pulled ${res.count} products from BigCommerce.`);
+      let nextPage: number | null = 1;
+      let totalPulled = 0;
+      let totalPages: number | null = null;
+      let channelName = 'Bonsai Outlet';
+
+      while (nextPage) {
+        const res = await pullFromBigCommerce({ page: nextPage });
+        totalPulled += res.count;
+        totalPages = res.totalPages;
+        channelName = res.channelName;
+        const pageRange = res.lastProcessedPage > res.currentPage
+          ? `pages ${res.currentPage}-${res.lastProcessedPage}`
+          : `page ${res.currentPage}`;
+        setPullProgress(`Pulling ${channelName}: ${pageRange}${res.totalPages ? ` of ${res.totalPages}` : ''}, ${totalPulled.toLocaleString()} products imported so far.`);
+        nextPage = res.nextPage;
+      }
+
+      alert(`Successfully pulled ${totalPulled.toLocaleString()} product${totalPulled === 1 ? '' : 's'} from BigCommerce channel "${channelName}".`);
     } catch (err: any) {
       setPullError(err.message);
     } finally {
+      setPullProgress(null);
       setPulling(false);
     }
   };
@@ -147,13 +166,14 @@ export default function Catalog() {
         </div>
         <div className="flex items-center gap-3">
           {pullError && <span className="text-xs text-red-500 font-medium">{pullError}</span>}
+          {pullProgress && !pullError && <span className="text-xs text-zinc-500 font-medium">{pullProgress}</span>}
           <button 
             onClick={handlePullFromBigCommerce}
             disabled={pulling}
             className="flex items-center gap-2 px-4 py-2 bg-zinc-900 text-white rounded-lg text-sm font-medium hover:bg-zinc-800 disabled:opacity-50 transition-colors"
           >
             {pulling ? <Loader2 className="w-4 h-4 animate-spin" /> : <DownloadCloud className="w-4 h-4" />}
-            {pulling ? 'Pulling...' : 'Pull from BigCommerce'}
+            {pulling ? 'Pulling Bonsai Outlet...' : 'Pull Bonsai Outlet from BigCommerce'}
           </button>
           <button className="flex items-center gap-2 px-4 py-2 bg-white border border-zinc-300 rounded-lg text-sm font-medium text-zinc-700 hover:bg-zinc-50">
             <Filter className="w-4 h-4" />
@@ -365,7 +385,7 @@ export default function Catalog() {
               </p>
               <div className="text-left">
                 <label className="block text-sm font-medium text-zinc-700 mb-1 flex items-center justify-between">
-                  <span>301 Redirect URL (Optional)</span>
+                  <span>Suggested Redirect URL (Optional)</span>
                   {isFetchingCategoryUrl && <Loader2 className="w-3 h-3 animate-spin text-zinc-400" />}
                 </label>
                 <input 
@@ -377,7 +397,7 @@ export default function Catalog() {
                   className="w-full px-3 py-2 border border-zinc-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-red-500/20 focus:border-red-500 text-sm disabled:bg-zinc-50 disabled:text-zinc-500"
                 />
                 <p className="text-xs text-zinc-500 mt-1">
-                  If provided, BigCommerce will redirect traffic from this product's old URL to the new URL.
+                  If provided, the sync processor will create a BigCommerce storefront redirect after the product is deleted.
                 </p>
               </div>
             </div>

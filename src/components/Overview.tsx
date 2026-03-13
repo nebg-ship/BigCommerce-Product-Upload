@@ -1,5 +1,5 @@
 import React from 'react';
-import { Package, AlertCircle, RefreshCw, CheckCircle2 } from 'lucide-react';
+import { Package, AlertCircle, RefreshCw } from 'lucide-react';
 import { motion } from 'motion/react';
 import { useQuery } from "convex/react";
 import { api } from "../../convex/_generated/api";
@@ -45,11 +45,15 @@ export default function Overview({ onNavigate }: { onNavigate: (tab: string) => 
 
       <div className="bg-white rounded-2xl shadow-sm border border-zinc-200 p-6">
         <h2 className="text-lg font-medium text-zinc-900 mb-4">System Status</h2>
-        <div className="flex items-center gap-4 p-4 bg-emerald-50 text-emerald-800 rounded-xl border border-emerald-100">
-          <CheckCircle2 className="w-6 h-6 text-emerald-500" />
+        <div className="flex items-center gap-4 p-4 bg-zinc-50 text-zinc-800 rounded-xl border border-zinc-200">
+          <RefreshCw className="w-6 h-6 text-emerald-500" />
           <div>
-            <p className="font-medium">BigCommerce Sync Service is Operational</p>
-            <p className="text-sm text-emerald-600 mt-1">Workers are currently polling the queue every 60 seconds.</p>
+            <p className="font-medium">BigCommerce queue processing is enabled</p>
+            <p className="text-sm text-zinc-600 mt-1">
+              Convex runs the queue processor every 60 seconds. Pending jobs can update existing
+              records, create new products and variants, and create delete redirects once the
+              BigCommerce credentials are configured on the Convex deployment.
+            </p>
           </div>
         </div>
       </div>
