@@ -2,11 +2,16 @@ import React, { useState } from 'react';
 import { Product } from '../types';
 import { motion } from 'motion/react';
 import { Search, Filter, DownloadCloud, Loader2, Edit2, X, Trash2, AlertTriangle } from 'lucide-react';
-import { useQuery, useMutation, useAction } from "convex/react";
+import { useQuery, useMutation, useAction, usePaginatedQuery } from "convex/react";
 import { api } from "../../convex/_generated/api";
 
 export default function Catalog() {
-  const products = useQuery(api.products.getProducts);
+  const stats = useQuery(api.products.getDashboardStats);
+  const {
+    results: products,
+    status: productsStatus,
+    loadMore,
+  } = usePaginatedQuery(api.products.getProducts, {}, { initialNumItems: 50 });
   const updateProduct = useMutation(api.products.updateProduct);
   const deleteProduct = useMutation(api.products.deleteProduct);
   const getCategoryUrl = useAction((api.bigcommerce as any).getCategoryUrl);
@@ -124,7 +129,7 @@ export default function Catalog() {
     }
   };
 
-  const filteredProducts = (products || []).filter(product => {
+  const filteredProducts = products.filter(product => {
     const query = searchQuery.toLowerCase();
     const matchName = product.name.toLowerCase().includes(query);
     const matchId = product.id.toLowerCase().includes(query);
@@ -141,15 +146,15 @@ export default function Catalog() {
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
         <div className="bg-white p-5 rounded-xl shadow-sm border border-zinc-200 flex flex-col">
           <span className="text-sm font-medium text-zinc-500 mb-1">Total Products</span>
-          <span className="text-3xl font-semibold text-zinc-900">{products === undefined ? '-' : products.length}</span>
+          <span className="text-3xl font-semibold text-zinc-900">{stats === undefined ? '-' : stats.totalProducts.toLocaleString()}</span>
         </div>
         <div className="bg-white p-5 rounded-xl shadow-sm border border-zinc-200 flex flex-col">
           <span className="text-sm font-medium text-zinc-500 mb-1">Active Products</span>
-          <span className="text-3xl font-semibold text-zinc-900">{products === undefined ? '-' : products.filter(p => p.status === 'active').length}</span>
+          <span className="text-3xl font-semibold text-zinc-900">{stats === undefined ? '-' : stats.activeProducts.toLocaleString()}</span>
         </div>
         <div className="bg-white p-5 rounded-xl shadow-sm border border-zinc-200 flex flex-col">
           <span className="text-sm font-medium text-zinc-500 mb-1">Visible on Storefront</span>
-          <span className="text-3xl font-semibold text-zinc-900">{products === undefined ? '-' : products.filter(p => p.is_visible === 1).length}</span>
+          <span className="text-3xl font-semibold text-zinc-900">{stats === undefined ? '-' : stats.visibleProducts.toLocaleString()}</span>
         </div>
       </div>
 
@@ -160,7 +165,7 @@ export default function Catalog() {
             type="text" 
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
-            placeholder="Search products by name, ID, or SKU..." 
+            placeholder="Search loaded products by name, ID, or SKU..." 
             className="w-full pl-10 pr-4 py-2 bg-white border border-zinc-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500"
           />
         </div>
@@ -186,14 +191,20 @@ export default function Catalog() {
         <div className="px-6 py-4 border-b border-zinc-200 bg-zinc-50 flex justify-between items-center">
           <h3 className="font-medium text-zinc-900">Products</h3>
           <span className="text-sm text-zinc-500 font-medium">
-            {products !== undefined && (
+            {productsStatus === 'LoadingFirstPage' ? 'Loading catalog...' : (
               <>
-                {filteredProducts.length} {filteredProducts.length === 1 ? 'product' : 'products'}
-                {searchQuery && ` (filtered from ${products.length})`}
+                {filteredProducts.length.toLocaleString()} {filteredProducts.length === 1 ? 'loaded match' : 'loaded matches'}
+                {searchQuery && ` (filtered from ${products.length.toLocaleString()} loaded)`}
+                {!searchQuery && stats && ` of ${stats.totalProducts.toLocaleString()} total`}
               </>
             )}
           </span>
         </div>
+        {searchQuery && productsStatus !== 'Exhausted' && (
+          <div className="px-6 py-3 border-b border-zinc-200 bg-amber-50 text-amber-800 text-xs font-medium">
+            Search currently filters the loaded rows only. Load more products to widen the results.
+          </div>
+        )}
         <div className="overflow-x-auto">
           <table className="w-full text-left text-sm">
             <thead className="bg-zinc-50 border-b border-zinc-200 text-zinc-500">
@@ -208,7 +219,7 @@ export default function Catalog() {
               </tr>
             </thead>
             <tbody className="divide-y divide-zinc-200">
-              {products === undefined ? (
+              {productsStatus === 'LoadingFirstPage' ? (
                 <tr><td colSpan={7} className="px-6 py-8 text-center text-zinc-500">Loading catalog...</td></tr>
               ) : filteredProducts.length === 0 ? (
                 <tr><td colSpan={7} className="px-6 py-8 text-center text-zinc-500">No products found.</td></tr>
@@ -262,6 +273,20 @@ export default function Catalog() {
               )}
             </tbody>
           </table>
+        </div>
+        <div className="px-6 py-4 border-t border-zinc-200 bg-zinc-50 flex items-center justify-between gap-4">
+          <span className="text-sm text-zinc-500">
+            Loaded {products.length.toLocaleString()}
+            {stats && ` of ${stats.totalProducts.toLocaleString()} products`}
+          </span>
+          <button
+            onClick={() => loadMore(50)}
+            disabled={productsStatus !== 'CanLoadMore'}
+            className="flex items-center gap-2 px-4 py-2 bg-white border border-zinc-300 rounded-lg text-sm font-medium text-zinc-700 hover:bg-zinc-100 disabled:opacity-50 disabled:hover:bg-white"
+          >
+            {productsStatus === 'LoadingMore' && <Loader2 className="w-4 h-4 animate-spin" />}
+            {productsStatus === 'Exhausted' ? 'All Products Loaded' : productsStatus === 'LoadingMore' ? 'Loading More...' : 'Load More'}
+          </button>
         </div>
       </div>
 

@@ -49,6 +49,16 @@ type BigCommerceVariantResponse = {
   data?: BigCommerceVariant | null;
 };
 
+type BigCommerceCustomField = {
+  id: number;
+  name?: string | null;
+  value?: string | null;
+};
+
+type BigCommerceCustomFieldListResponse = {
+  data?: BigCommerceCustomField[] | null;
+};
+
 type BigCommerceOptionValue = {
   id: number;
   label: string;
@@ -235,9 +245,35 @@ function safeParsePayload(payload: string | undefined): Record<string, unknown> 
   }
 }
 
-function buildProductUpdatePayload(product: ProductRecord) {
+function toBigCommerceMetaKeywords(metaKeywords: string | undefined): string[] | undefined {
+  if (!metaKeywords) {
+    return undefined;
+  }
+
+  const keywords = metaKeywords
+    .split(",")
+    .map((keyword) => keyword.trim())
+    .filter(Boolean);
+
+  return keywords.length > 0 ? keywords : undefined;
+}
+
+function getProductAvailability(product: ProductRecord): string {
+  if (product.availability) {
+    return product.availability;
+  }
+
+  if (product.allow_purchases === 0) {
+    return "disabled";
+  }
+
+  return "available";
+}
+
+function buildProductUpdatePayload(product: ProductRecord, changedFields?: Set<string>) {
+  const fieldChanged = (field: string) => changedFields?.has(field) ?? false;
   const payload: Record<string, unknown> = {
-    availability: product.status === "active" ? "available" : "disabled",
+    availability: getProductAvailability(product),
     description: product.description ?? "",
     is_visible: product.is_visible === 1,
     name: product.name,
@@ -253,6 +289,119 @@ function buildProductUpdatePayload(product: ProductRecord) {
     }
   }
 
+  if (product.cost_price !== undefined) {
+    payload.cost_price = product.cost_price;
+  }
+
+  if (product.retail_price !== undefined) {
+    payload.retail_price = product.retail_price;
+  }
+
+  if (product.sale_price !== undefined) {
+    payload.sale_price = product.sale_price;
+  }
+
+  if (product.weight !== undefined) {
+    payload.weight = product.weight;
+  }
+
+  if (product.width !== undefined) {
+    payload.width = product.width;
+  }
+
+  if (product.height !== undefined) {
+    payload.height = product.height;
+  }
+
+  if (product.depth !== undefined) {
+    payload.depth = product.depth;
+  }
+
+  if (product.page_title) {
+    payload.page_title = product.page_title;
+  } else if (fieldChanged("page_title")) {
+    payload.page_title = "";
+  }
+
+  if (product.meta_description) {
+    payload.meta_description = product.meta_description;
+  } else if (fieldChanged("meta_description")) {
+    payload.meta_description = "";
+  }
+
+  const metaKeywords = toBigCommerceMetaKeywords(product.meta_keywords);
+  if (metaKeywords) {
+    payload.meta_keywords = metaKeywords;
+  } else if (fieldChanged("meta_keywords")) {
+    payload.meta_keywords = [];
+  }
+
+  if (product.search_keywords !== undefined) {
+    payload.search_keywords = product.search_keywords;
+  } else if (fieldChanged("search_keywords")) {
+    payload.search_keywords = "";
+  }
+
+  if (product.condition) {
+    payload.condition = product.condition;
+  }
+
+  if (product.is_condition_shown !== undefined) {
+    payload.is_condition_shown = product.is_condition_shown === 1;
+  }
+
+  if (product.inventory_warning_level !== undefined) {
+    payload.inventory_warning_level = product.inventory_warning_level;
+  }
+
+  if (product.availability_description !== undefined) {
+    payload.availability_description = product.availability_description;
+  } else if (fieldChanged("availability_description")) {
+    payload.availability_description = "";
+  }
+
+  if (product.warranty !== undefined) {
+    payload.warranty = product.warranty;
+  } else if (fieldChanged("warranty")) {
+    payload.warranty = "";
+  }
+
+  if (product.is_free_shipping !== undefined) {
+    payload.is_free_shipping = product.is_free_shipping === 1;
+  }
+
+  if (product.fixed_cost_shipping_price !== undefined) {
+    payload.fixed_cost_shipping_price = product.fixed_cost_shipping_price;
+  }
+
+  if (product.order_quantity_minimum !== undefined) {
+    payload.order_quantity_minimum = product.order_quantity_minimum;
+  }
+
+  if (product.order_quantity_maximum !== undefined) {
+    payload.order_quantity_maximum = product.order_quantity_maximum;
+  }
+
+  if (product.upc) {
+    payload.upc = product.upc;
+  } else if (fieldChanged("upc")) {
+    payload.upc = "";
+  }
+
+  if (product.mpn) {
+    payload.mpn = product.mpn;
+  } else if (fieldChanged("mpn")) {
+    payload.mpn = "";
+  }
+
+  if (product.sort_order !== undefined) {
+    payload.sort_order = product.sort_order;
+  }
+
+  if (product.category_ids !== undefined) {
+    payload.categories = product.category_ids;
+  }
+
   return payload;
 }
 
@@ -260,11 +409,15 @@ function buildProductCreatePayload(snapshot: ProductSnapshot) {
   const primaryVariant = selectPrimaryVariant(snapshot.variants);
   const payload = buildProductUpdatePayload(snapshot.product);
   payload.type = "physical";
-  payload.weight = 0;
+  payload.weight = snapshot.product.weight ?? 0;
 
-  const defaultCategoryIds = getDefaultCategoryIds();
-  if (defaultCategoryIds.length > 0) {
-    payload.categories = defaultCategoryIds;
+  if (snapshot.product.category_ids !== undefined) {
+    payload.categories = snapshot.product.category_ids;
+  } else {
+    const defaultCategoryIds = getDefaultCategoryIds();
+    if (defaultCategoryIds.length > 0) {
+      payload.categories = defaultCategoryIds;
+    }
   }
 
   if (primaryVariant?.sku) {
@@ -331,6 +484,96 @@ async function fetchRemoteOptions(client: BigCommerceClient, productId: string) 
   );
 
   return response?.data ?? [];
+}
+
+async function fetchRemoteCustomFields(client: BigCommerceClient, productId: string) {
+  const response = await bigCommerceRequest<BigCommerceCustomFieldListResponse>(
+    client,
+    `/v3/catalog/products/${productId}/custom-fields?limit=250`,
+  );
+
+  return response?.data ?? [];
+}
+
+async function syncRemoteCustomFields(
+  client: BigCommerceClient,
+  productId: string,
+  localCustomFields: ProductRecord["custom_fields"] | undefined,
+) {
+  if (localCustomFields === undefined) {
+    return;
+  }
+
+  const normalizedLocalFields = [...new Map(
+    localCustomFields
+      .map((field) => {
+        const name = field.name.trim();
+        return name ? [name, field.value.trim()] as const : null;
+      })
+      .filter((entry): entry is readonly [string, string] => entry !== null),
+  ).entries()]
+    .sort(([leftName], [rightName]) => leftName.localeCompare(rightName))
+    .map(([name, value]) => ({ name, value }));
+
+  const remoteFields = await fetchRemoteCustomFields(client, productId);
+  const remoteFieldsByName = new Map<string, BigCommerceCustomField[]>();
+  for (const remoteField of remoteFields) {
+    const name = remoteField.name?.trim();
+    if (!name) {
+      continue;
+    }
+
+    const existing = remoteFieldsByName.get(name) ?? [];
+    existing.push(remoteField);
+    remoteFieldsByName.set(name, existing);
+  }
+
+  for (const localField of normalizedLocalFields) {
+    const remoteEntries = remoteFieldsByName.get(localField.name) ?? [];
+    const [matchedRemoteField, ...duplicateRemoteFields] = remoteEntries;
+    if (!matchedRemoteField) {
+      await bigCommerceRequest(
+        client,
+        `/v3/catalog/products/${productId}/custom-fields`,
+        {
+          body: JSON.stringify(localField),
+          method: "POST",
+        },
+      );
+      continue;
+    }
+
+    if ((matchedRemoteField.value ?? "") !== localField.value) {
+      await bigCommerceRequest(
+        client,
+        `/v3/catalog/products/${productId}/custom-fields/${matchedRemoteField.id}`,
+        {
+          body: JSON.stringify(localField),
+          method: "PUT",
+        },
+      );
+    }
+
+    for (const duplicateRemoteField of duplicateRemoteFields) {
+      await bigCommerceRequest(
+        client,
+        `/v3/catalog/products/${productId}/custom-fields/${duplicateRemoteField.id}`,
+        { method: "DELETE" },
+      );
+    }
+
+    remoteFieldsByName.delete(localField.name);
+  }
+
+  for (const obsoleteRemoteFields of remoteFieldsByName.values()) {
+    for (const remoteField of obsoleteRemoteFields) {
+      await bigCommerceRequest(
+        client,
+        `/v3/catalog/products/${productId}/custom-fields/${remoteField.id}`,
+        { method: "DELETE" },
+      );
+    }
+  }
 }
 
 async function resolveSiteIds(client: BigCommerceClient) {
@@ -521,6 +764,7 @@ async function createRemoteVariant(
 
 async function processProductJob(ctx: any, client: BigCommerceClient, job: SyncJob): Promise<ProcessJobOutcome> {
   const payload = safeParsePayload(job.payload);
+  const changedFields = new Set(Object.keys(payload));
 
   if (job.action === "delete") {
     const payloadExternalProductId =
@@ -583,6 +827,7 @@ async function processProductJob(ctx: any, client: BigCommerceClient, job: SyncJ
 
     const createdProduct = await createRemoteProduct(client, snapshot);
     const newExternalProductId = createdProduct.id.toString();
+    await syncRemoteCustomFields(client, newExternalProductId, product.custom_fields);
     await ctx.runMutation(internal.syncProcessor.rebindCreatedProduct, {
       oldIdentifier: job.internal_id,
       productId: product._id,
@@ -596,10 +841,14 @@ async function processProductJob(ctx: any, client: BigCommerceClient, job: SyncJ
     client,
     `/v3/catalog/products/${remoteProduct.id}`,
     {
-      body: JSON.stringify(buildProductUpdatePayload(product)),
+      body: JSON.stringify(buildProductUpdatePayload(product, changedFields)),
       method: "PUT",
     },
   );
+
+  if (changedFields.has("custom_fields")) {
+    await syncRemoteCustomFields(client, remoteProduct.id.toString(), product.custom_fields ?? []);
+  }
 
   return { productId: product._id };
 }
