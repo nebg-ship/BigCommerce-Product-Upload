@@ -10,11 +10,32 @@ type ProductCustomField = {
 };
 
 type ProductImage = {
+  image_id?: number;
   image_url: string;
   description?: string;
   is_thumbnail?: boolean;
   sort_order?: number;
 };
+
+type MutableProductImage = {
+  image_id?: number;
+  image_url?: string;
+  description?: string;
+  is_thumbnail?: boolean;
+  sort_order?: number;
+};
+
+const IMAGE_ID_COLUMN_PATTERN = /^Product Image ID - (\d+)$/;
+const IMAGE_URL_COLUMN_PATTERNS = [
+  /^Product Image URL - (\d+)$/,
+  /^Product Image File - (\d+)$/,
+];
+const IMAGE_DESCRIPTION_COLUMN_PATTERN = /^Product Image Description - (\d+)$/;
+const IMAGE_SORT_COLUMN_PATTERNS = [
+  /^Product Image Sort Order - (\d+)$/,
+  /^Product Image Sort - (\d+)$/,
+];
+const IMAGE_THUMBNAIL_COLUMN_PATTERN = /^Product Image Is Thumbnail - (\d+)$/;
 
 function readString(value: unknown): string | undefined {
   if (value === null || value === undefined) {
@@ -116,25 +137,335 @@ function normalizeProductCustomFields(fields: ProductCustomField[]): ProductCust
 }
 
 function normalizeProductImages(images: ProductImage[]): ProductImage[] {
-  const entries = new Map<string, ProductImage>();
+  const normalizedImages: MutableProductImage[] = [];
+  const imagesById = new Map<number, MutableProductImage>();
+  const imagesByUrl = new Map<string, MutableProductImage>();
+
+  const unlinkImage = (image: MutableProductImage) => {
+    if (image.image_id !== undefined && imagesById.get(image.image_id) === image) {
+      imagesById.delete(image.image_id);
+    }
+
+    if (image.image_url && imagesByUrl.get(image.image_url) === image) {
+      imagesByUrl.delete(image.image_url);
+    }
+  };
+
+  const linkImage = (image: MutableProductImage) => {
+    if (image.image_id !== undefined) {
+      imagesById.set(image.image_id, image);
+    }
+
+    if (image.image_url) {
+      imagesByUrl.set(image.image_url, image);
+    }
+  };
+
+  const applyImageValues = (target: MutableProductImage, source: MutableProductImage) => {
+    unlinkImage(target);
+
+    if (source.image_id !== undefined) {
+      target.image_id = source.image_id;
+    }
+
+    if (source.image_url !== undefined) {
+      target.image_url = source.image_url;
+    }
+
+    if (source.description !== undefined) {
+      target.description = source.description;
+    }
+
+    if (source.is_thumbnail !== undefined) {
+      target.is_thumbnail = source.is_thumbnail;
+    }
+
+    if (source.sort_order !== undefined) {
+      target.sort_order = source.sort_order;
+    }
+
+    linkImage(target);
+  };
+
+  const mergeImages = (target: MutableProductImage, source: MutableProductImage) => {
+    if (target === source) {
+      return target;
+    }
+
+    applyImageValues(target, source);
+    unlinkImage(source);
+
+    const sourceIndex = normalizedImages.indexOf(source);
+    if (sourceIndex >= 0) {
+      normalizedImages.splice(sourceIndex, 1);
+    }
+
+    return target;
+  };
+
   for (const image of images) {
     const imageUrl = readString(image.image_url);
-    if (!imageUrl) {
+    const imageId = readInteger(image.image_id);
+    if (!imageUrl && imageId === undefined) {
       continue;
     }
 
-    entries.set(imageUrl, {
-      image_url: imageUrl,
+    const nextImage: MutableProductImage = {
+      ...(imageId === undefined ? {} : { image_id: imageId }),
+      ...(imageUrl === undefined ? {} : { image_url: imageUrl }),
       description: readString(image.description),
       is_thumbnail: typeof image.is_thumbnail === "boolean" ? image.is_thumbnail : undefined,
       sort_order: readInteger(image.sort_order),
-    });
+    };
+
+    const matchedById = imageId === undefined ? undefined : imagesById.get(imageId);
+    const matchedByUrl = imageUrl === undefined ? undefined : imagesByUrl.get(imageUrl);
+    let target = matchedById ?? matchedByUrl;
+
+    if (matchedById && matchedByUrl && matchedById !== matchedByUrl) {
+      target = mergeImages(matchedById, matchedByUrl);
+    }
+
+    if (!target) {
+      target = {};
+      normalizedImages.push(target);
+    }
+
+    applyImageValues(target, nextImage);
   }
 
-  return [...entries.values()].sort((left, right) => {
+  return normalizedImages.map((image) => ({
+    ...(image.image_id === undefined ? {} : { image_id: image.image_id }),
+    image_url: image.image_url ?? `image-${image.image_id}`,
+    ...(image.description === undefined ? {} : { description: image.description }),
+    ...(image.is_thumbnail === undefined ? {} : { is_thumbnail: image.is_thumbnail }),
+    ...(image.sort_order === undefined ? {} : { sort_order: image.sort_order }),
+  })).sort((left, right) => {
     const sortDifference = (left.sort_order ?? 0) - (right.sort_order ?? 0);
-    return sortDifference !== 0 ? sortDifference : left.image_url.localeCompare(right.image_url);
+    if (sortDifference !== 0) {
+      return sortDifference;
+    }
+
+    if ((left.image_id ?? 0) !== (right.image_id ?? 0)) {
+      return (left.image_id ?? 0) - (right.image_id ?? 0);
+    }
+
+    return left.image_url.localeCompare(right.image_url);
   });
+}
+
+function findMatchingProductImage(
+  images: ProductImage[],
+  imageId: number | undefined,
+  imageUrl: string | undefined,
+  slot: number,
+) {
+  const slotIndex = slot - 1;
+  const slotImage = slotIndex >= 0 && slotIndex < images.length ? images[slotIndex] : undefined;
+
+  const idIndex = imageId === undefined
+    ? -1
+    : images.findIndex((image) => image.image_id === imageId);
+  if (idIndex >= 0) {
+    const mergeIndex = slotImage && slotIndex !== idIndex && slotImage.image_id === undefined
+      ? slotIndex
+      : -1;
+
+    return {
+      matchIndex: idIndex,
+      mergeIndex,
+    };
+  }
+
+  const urlIndex = imageUrl === undefined
+    ? -1
+    : images.findIndex((image) => image.image_url === imageUrl);
+  if (urlIndex >= 0) {
+    return {
+      matchIndex: urlIndex,
+      mergeIndex: -1,
+    };
+  }
+
+  if (imageId !== undefined && slotImage && slotImage.image_id === undefined) {
+    return {
+      matchIndex: slotIndex,
+      mergeIndex: -1,
+    };
+  }
+
+  return null;
+}
+
+function readFirstPresentValue(row: Record<string, unknown>, columns: string[]) {
+  for (const column of columns) {
+    if (hasColumn(row, column)) {
+      return row[column];
+    }
+  }
+
+  return undefined;
+}
+
+function hasAnyColumn(row: Record<string, unknown>, columns: string[]) {
+  return columns.some((column) => hasColumn(row, column));
+}
+
+function getImageFieldColumns(
+  slot: number,
+  field: "id" | "url" | "description" | "sort" | "thumbnail",
+) {
+  switch (field) {
+    case "id":
+      return [`Product Image ID - ${slot}`];
+    case "url":
+      return slot === 1
+        ? [`Product Image URL - 1`, `Product Image File - 1`, "Image URL"]
+        : [`Product Image URL - ${slot}`, `Product Image File - ${slot}`];
+    case "description":
+      return slot === 1
+        ? [`Product Image Description - 1`, "Image Description"]
+        : [`Product Image Description - ${slot}`];
+    case "sort":
+      return slot === 1
+        ? [`Product Image Sort Order - 1`, `Product Image Sort - 1`, "Image Sort Order"]
+        : [`Product Image Sort Order - ${slot}`, `Product Image Sort - ${slot}`];
+    case "thumbnail":
+      return slot === 1
+        ? [`Product Image Is Thumbnail - 1`, "Image Is Thumbnail"]
+        : [`Product Image Is Thumbnail - ${slot}`];
+  }
+}
+
+function getImageSlotFromColumn(column: string): number | null {
+  if (column === "Image URL" || column === "Image Description" || column === "Image Sort Order" || column === "Image Is Thumbnail") {
+    return 1;
+  }
+
+  const patterns = [
+    IMAGE_ID_COLUMN_PATTERN,
+    IMAGE_DESCRIPTION_COLUMN_PATTERN,
+    IMAGE_THUMBNAIL_COLUMN_PATTERN,
+    ...IMAGE_URL_COLUMN_PATTERNS,
+    ...IMAGE_SORT_COLUMN_PATTERNS,
+  ];
+
+  for (const pattern of patterns) {
+    const match = column.match(pattern);
+    if (match) {
+      return Number(match[1]);
+    }
+  }
+
+  return null;
+}
+
+function getImageSlotsFromRow(row: Record<string, unknown>) {
+  const slots = new Set<number>();
+  for (const column of Object.keys(row)) {
+    const slot = getImageSlotFromColumn(column);
+    if (slot !== null) {
+      slots.add(slot);
+    }
+  }
+
+  return [...slots].sort((left, right) => left - right);
+}
+
+function hasMeaningfulValue(value: unknown) {
+  if (value === null || value === undefined) {
+    return false;
+  }
+
+  if (typeof value === "string") {
+    return value.trim().length > 0;
+  }
+
+  return true;
+}
+
+function slotHasAnyImageData(row: Record<string, unknown>, slot: number) {
+  const slotColumns = [
+    ...getImageFieldColumns(slot, "id"),
+    ...getImageFieldColumns(slot, "url"),
+    ...getImageFieldColumns(slot, "description"),
+    ...getImageFieldColumns(slot, "sort"),
+    ...getImageFieldColumns(slot, "thumbnail"),
+  ];
+
+  return slotColumns.some((column) => hasColumn(row, column) && hasMeaningfulValue(row[column]));
+}
+
+function hasImageFieldForSlot(
+  row: Record<string, unknown>,
+  slot: number,
+  field: "id" | "url" | "description" | "sort" | "thumbnail",
+) {
+  return hasAnyColumn(row, getImageFieldColumns(slot, field));
+}
+
+function buildImageUpdatesFromRow(
+  existingImages: ProductImage[] | undefined,
+  row: Record<string, unknown>,
+): ProductImage[] {
+  const nextImages = normalizeProductImages(existingImages ?? []);
+
+  for (const slot of getImageSlotsFromRow(row)) {
+    if (!slotHasAnyImageData(row, slot)) {
+      continue;
+    }
+
+    const imageId = readInteger(readFirstPresentValue(row, getImageFieldColumns(slot, "id")));
+    const imageUrl = readString(readFirstPresentValue(row, getImageFieldColumns(slot, "url")));
+    if (imageId === undefined && !imageUrl) {
+      throw new Error(`Product Image ID - ${slot} or image URL for slot ${slot} is required when updating image fields.`);
+    }
+
+    const match = findMatchingProductImage(nextImages, imageId, imageUrl, slot);
+    const matchedImage = match ? nextImages[match.matchIndex] : undefined;
+    if (!matchedImage && !imageUrl) {
+      throw new Error(`Image slot ${slot} could not be matched locally. Provide the image URL for this slot.`);
+    }
+
+    const mergeImage = match && match.mergeIndex >= 0 ? nextImages[match.mergeIndex] : undefined;
+    const currentImage = mergeImage ?? matchedImage ?? {
+      ...(imageId === undefined ? {} : { image_id: imageId }),
+      image_url: imageUrl ?? `image-${imageId}`,
+    };
+
+    const nextImage: ProductImage = {
+      ...currentImage,
+      ...(imageId === undefined ? {} : { image_id: imageId }),
+      image_url: imageId === undefined
+        ? imageUrl ?? currentImage.image_url
+        : currentImage.image_url,
+    };
+
+    if (hasImageFieldForSlot(row, slot, "description")) {
+      nextImage.description = readString(readFirstPresentValue(row, getImageFieldColumns(slot, "description")));
+    }
+
+    if (hasImageFieldForSlot(row, slot, "sort")) {
+      nextImage.sort_order = readInteger(readFirstPresentValue(row, getImageFieldColumns(slot, "sort")));
+    }
+
+    if (hasImageFieldForSlot(row, slot, "thumbnail")) {
+      nextImage.is_thumbnail = readBooleanFlag(readFirstPresentValue(row, getImageFieldColumns(slot, "thumbnail")));
+    }
+
+    if (match) {
+      const targetIndex = match.mergeIndex >= 0 ? match.mergeIndex : match.matchIndex;
+      nextImages[targetIndex] = nextImage;
+
+      if (match.mergeIndex >= 0 && match.matchIndex !== targetIndex) {
+        nextImages.splice(match.matchIndex, 1);
+      }
+    } else {
+      nextImages.push(nextImage);
+    }
+  }
+
+  return normalizeProductImages(nextImages);
 }
 
 function parseProductCustomFields(value: unknown): ProductCustomField[] | undefined {
@@ -230,6 +561,7 @@ function parseProductImages(value: unknown): ProductImage[] | undefined {
           }
 
           return [{
+            image_id: readInteger(record.image_id ?? record.imageId ?? record.id),
             image_url: imageUrl,
             description: readString(record.description ?? record.alt_text ?? record.alt),
             is_thumbnail: readBooleanFlag(record.is_thumbnail ?? record.isThumbnail),
@@ -266,7 +598,28 @@ function hasColumn(record: Record<string, unknown>, column: string) {
 }
 
 const ALWAYS_INCLUDED_UPDATE_COLUMNS = new Set(["Product ID", "Code", "Item Type"]);
-const IMAGE_SELECTION_COLUMNS = new Set(["Image Description", "Image Sort Order", "Image Is Thumbnail"]);
+const IMAGE_SELECTION_COLUMNS = new Set([
+  "Image Description",
+  "Image Sort Order",
+  "Image Is Thumbnail",
+  "Product Image Description - 1",
+  "Product Image Sort Order - 1",
+  "Product Image Sort - 1",
+  "Product Image Is Thumbnail - 1",
+]);
+
+function isImageHelperColumn(column: string) {
+  return column === "Image URL" ||
+    IMAGE_ID_COLUMN_PATTERN.test(column) ||
+    IMAGE_URL_COLUMN_PATTERNS.some((pattern) => pattern.test(column));
+}
+
+function isImageSelectableColumn(column: string) {
+  return IMAGE_SELECTION_COLUMNS.has(column) ||
+    IMAGE_DESCRIPTION_COLUMN_PATTERN.test(column) ||
+    IMAGE_SORT_COLUMN_PATTERNS.some((pattern) => pattern.test(column)) ||
+    IMAGE_THUMBNAIL_COLUMN_PATTERN.test(column);
+}
 
 function filterRecordForSelectedFields(
   record: Record<string, unknown>,
@@ -278,14 +631,26 @@ function filterRecordForSelectedFields(
   }
 
   const selectedFieldSet = new Set(selectedFields);
-  const includeImageUrl = [...IMAGE_SELECTION_COLUMNS].some((column) => selectedFieldSet.has(column));
+  const selectedImageSlots = new Set<number>();
+  for (const field of selectedFieldSet) {
+    if (!isImageSelectableColumn(field)) {
+      continue;
+    }
+
+    const slot = getImageSlotFromColumn(field);
+    if (slot !== null) {
+      selectedImageSlots.add(slot);
+    }
+  }
+
   const filteredRecord: Record<string, unknown> = {};
 
   for (const [key, value] of Object.entries(record)) {
+    const imageSlot = getImageSlotFromColumn(key);
     if (
       ALWAYS_INCLUDED_UPDATE_COLUMNS.has(key) ||
       selectedFieldSet.has(key) ||
-      (key === "Image URL" && includeImageUrl)
+      (imageSlot !== null && isImageHelperColumn(key) && selectedImageSlots.has(imageSlot))
     ) {
       filteredRecord[key] = value;
     }
@@ -367,6 +732,10 @@ export const processRecords = internalMutation({
 
     let validCount = 0;
     let invalidCount = 0;
+    let changedRowCount = 0;
+    let unchangedRowCount = 0;
+    let productJobsCreated = 0;
+    let variantJobsCreated = 0;
     const errors: { row: number; error: string; data: any }[] = [];
 
     let rowIndex = 0;
@@ -407,6 +776,8 @@ export const processRecords = internalMutation({
             created_at: new Date().toISOString(),
             updated_at: new Date().toISOString()
           });
+          changedRowCount++;
+          productJobsCreated++;
           validCount++;
         } catch (err: any) {
           invalidCount++;
@@ -455,21 +826,6 @@ export const processRecords = internalMutation({
         const orderQuantityMinimum = readInteger(row['Minimum Purchase Quantity']);
         const orderQuantityMaximum = readInteger(row['Maximum Purchase Quantity']);
         const customFields = parseProductCustomFields(row['Product Custom Fields']);
-        const productImages = hasColumn(row, 'Product Images')
-          ? parseProductImages(row['Product Images'])
-          : (
-            hasColumn(row, 'Image URL') ||
-            hasColumn(row, 'Image Description') ||
-            hasColumn(row, 'Image Sort Order') ||
-            hasColumn(row, 'Image Is Thumbnail')
-          )
-            ? parseProductImages(JSON.stringify([{
-                image_url: row['Image URL'],
-                description: row['Image Description'],
-                sort_order: row['Image Sort Order'],
-                is_thumbnail: row['Image Is Thumbnail'],
-              }]))
-            : undefined;
         const upc = readString(row['Product UPC/EAN']);
         const mpn = readString(row['Manufacturer Part Number']);
 
@@ -497,6 +853,16 @@ export const processRecords = internalMutation({
         let productAction = 'create';
         let productIdentifier: string;
         const now = new Date().toISOString();
+        let productJobCreated = false;
+        let variantJobCreated = false;
+        const hasFullImagesColumn = hasColumn(row, 'Product Images');
+        const imageSlots = getImageSlotsFromRow(row);
+        const hasSingleImageColumns = imageSlots.length > 0;
+        const productImages = hasFullImagesColumn
+          ? parseProductImages(row['Product Images'])
+          : hasSingleImageColumns
+            ? buildImageUpdatesFromRow(product?.images as ProductImage[] | undefined, row)
+            : undefined;
 
         if (product) {
           productAction = 'update';
@@ -559,14 +925,7 @@ export const processRecords = internalMutation({
             productPatch.custom_fields = customFields;
           }
 
-          if (
-            (hasColumn(row, 'Product Images') ||
-              hasColumn(row, 'Image URL') ||
-              hasColumn(row, 'Image Description') ||
-              hasColumn(row, 'Image Sort Order') ||
-              hasColumn(row, 'Image Is Thumbnail')) &&
-            !arraysEqual(product.images, productImages)
-          ) {
+          if ((hasFullImagesColumn || hasSingleImageColumns) && !arraysEqual(product.images, productImages)) {
             productChanges.images = { old: product.images, new: productImages };
             productPatch.images = productImages;
           }
@@ -630,7 +989,7 @@ export const processRecords = internalMutation({
           assignCreateField('Maximum Purchase Quantity', 'order_quantity_maximum', orderQuantityMaximum);
           assignCreateField('Product Custom Fields', 'custom_fields', customFields);
           assignCreateField('Product Images', 'images', productImages);
-          if (!hasColumn(row, 'Product Images') && productImages !== undefined) {
+          if (!hasFullImagesColumn && productImages !== undefined) {
             createPayload.images = productImages;
             productChanges.images = { new: productImages };
           }
@@ -656,6 +1015,8 @@ export const processRecords = internalMutation({
             created_at: now,
             updated_at: now
           });
+          productJobCreated = true;
+          productJobsCreated++;
         }
 
         if (sku) {
@@ -716,7 +1077,15 @@ export const processRecords = internalMutation({
               created_at: now,
               updated_at: now
             });
+            variantJobCreated = true;
+            variantJobsCreated++;
           }
+        }
+
+        if (productJobCreated || variantJobCreated) {
+          changedRowCount++;
+        } else {
+          unchangedRowCount++;
         }
         
         validCount++;
@@ -732,10 +1101,26 @@ export const processRecords = internalMutation({
       row_count: records.length,
       valid_row_count: validCount,
       invalid_row_count: invalidCount,
+      changed_row_count: changedRowCount,
+      unchanged_row_count: unchangedRowCount,
+      sync_jobs_created_count: productJobsCreated + variantJobsCreated,
+      product_jobs_created_count: productJobsCreated,
+      variant_jobs_created_count: variantJobsCreated,
       errors: JSON.stringify(errors),
       created_at: new Date().toISOString()
     });
 
-    return { success: true, importId, validCount, invalidCount, errors };
+    return {
+      success: true,
+      importId,
+      validCount,
+      invalidCount,
+      changedRowCount,
+      unchangedRowCount,
+      syncJobsCreatedCount: productJobsCreated + variantJobsCreated,
+      productJobsCreatedCount: productJobsCreated,
+      variantJobsCreatedCount: variantJobsCreated,
+      errors,
+    };
   }
 });

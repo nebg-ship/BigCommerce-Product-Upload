@@ -36,6 +36,7 @@ export interface Product {
   order_quantity_maximum?: number | null;
   custom_fields?: Array<{ name: string; value: string }> | null;
   images?: Array<{
+    image_id?: number | null;
     image_url: string;
     description?: string | null;
     is_thumbnail?: boolean | null;
@@ -80,6 +81,11 @@ export interface ImportRun {
   row_count: number;
   valid_row_count: number;
   invalid_row_count: number;
+  changed_row_count?: number | null;
+  unchanged_row_count?: number | null;
+  sync_jobs_created_count?: number | null;
+  product_jobs_created_count?: number | null;
+  variant_jobs_created_count?: number | null;
   errors?: string | null;
   created_at: string;
 }
@@ -87,8 +93,8 @@ export interface ImportRun {
 export interface DashboardStats {
   totalProducts: number;
   totalVariants: number;
-  activeProducts: number;
-  visibleProducts: number;
-  pendingSyncs: number;
+  activeProducts: number | null;
+  visibleProducts: number | null;
+  pendingSyncs: number | null;
   failedSyncs: number;
 }

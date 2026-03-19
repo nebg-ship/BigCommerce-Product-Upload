@@ -30,16 +30,16 @@ export default function Overview({ onNavigate }: { onNavigate: (tab: string) => 
         />
         <StatCard 
           title="Pending Syncs" 
-          value={stats.pendingSyncs} 
+          value={stats.pendingSyncs ?? 0} 
           icon={<RefreshCw className="w-6 h-6 text-amber-500" />} 
           onClick={() => onNavigate('queue')}
         />
         <StatCard 
           title="Failed / Dead Jobs" 
-          value={stats.failedSyncs} 
+          value={stats.failedSyncs ?? 0} 
           icon={<AlertCircle className="w-6 h-6 text-red-500" />} 
           onClick={() => onNavigate('queue')}
-          alert={stats.failedSyncs > 0}
+          alert={(stats.failedSyncs ?? 0) > 0}
         />
       </div>
 

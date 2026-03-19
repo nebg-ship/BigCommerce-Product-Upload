@@ -5,7 +5,7 @@ import { internal } from "./_generated/api";
 
 const DEFAULT_PULL_CHANNEL_NAME = "Bonsai Outlet";
 const BIGCOMMERCE_PAGE_SIZE = 250;
-const PAGES_PER_PULL_CALL = 5;
+const PAGES_PER_PULL_CALL = 2;
 
 type BigCommerceCredentials = {
   accessToken: string;
@@ -28,6 +28,7 @@ type BigCommerceCustomField = {
 
 type BigCommerceImage = {
   description?: string | null;
+  id?: number | null;
   image_file?: string | null;
   image_url?: string | null;
   is_thumbnail?: boolean | null;
@@ -38,6 +39,14 @@ type BigCommerceImage = {
   url_thumbnail?: string | null;
   url_zoom?: string | null;
   zoom_url?: string | null;
+};
+
+type MutableProductImage = {
+  image_id?: number;
+  image_url?: string;
+  description?: string;
+  is_thumbnail?: boolean;
+  sort_order?: number;
 };
 
 type BigCommerceProduct = {
@@ -200,12 +209,71 @@ function toImages(value: BigCommerceImage[] | null | undefined) {
     return undefined;
   }
 
-  const entries = new Map<string, {
-    image_url: string;
-    description?: string;
-    is_thumbnail?: boolean;
-    sort_order?: number;
-  }>();
+  const normalizedImages: MutableProductImage[] = [];
+  const imagesById = new Map<number, MutableProductImage>();
+  const imagesByUrl = new Map<string, MutableProductImage>();
+
+  const unlinkImage = (image: MutableProductImage) => {
+    if (image.image_id !== undefined && imagesById.get(image.image_id) === image) {
+      imagesById.delete(image.image_id);
+    }
+
+    if (image.image_url && imagesByUrl.get(image.image_url) === image) {
+      imagesByUrl.delete(image.image_url);
+    }
+  };
+
+  const linkImage = (image: MutableProductImage) => {
+    if (image.image_id !== undefined) {
+      imagesById.set(image.image_id, image);
+    }
+
+    if (image.image_url) {
+      imagesByUrl.set(image.image_url, image);
+    }
+  };
+
+  const applyImageValues = (target: MutableProductImage, source: MutableProductImage) => {
+    unlinkImage(target);
+
+    if (source.image_id !== undefined) {
+      target.image_id = source.image_id;
+    }
+
+    if (source.image_url !== undefined) {
+      target.image_url = source.image_url;
+    }
+
+    if (source.description !== undefined) {
+      target.description = source.description;
+    }
+
+    if (source.is_thumbnail !== undefined) {
+      target.is_thumbnail = source.is_thumbnail;
+    }
+
+    if (source.sort_order !== undefined) {
+      target.sort_order = source.sort_order;
+    }
+
+    linkImage(target);
+  };
+
+  const mergeImages = (target: MutableProductImage, source: MutableProductImage) => {
+    if (target === source) {
+      return target;
+    }
+
+    applyImageValues(target, source);
+    unlinkImage(source);
+
+    const sourceIndex = normalizedImages.indexOf(source);
+    if (sourceIndex >= 0) {
+      normalizedImages.splice(sourceIndex, 1);
+    }
+
+    return target;
+  };
 
   for (const image of value) {
     const imageUrl = normalizeImageUrl(
@@ -222,17 +290,48 @@ function toImages(value: BigCommerceImage[] | null | undefined) {
       continue;
     }
 
-    entries.set(imageUrl, {
+    const imageId = toOptionalInteger(image?.id);
+    const nextImage: MutableProductImage = {
+      ...(imageId === undefined ? {} : { image_id: imageId }),
       image_url: imageUrl,
       description: toOptionalString(image?.description),
       is_thumbnail: typeof image?.is_thumbnail === "boolean" ? image.is_thumbnail : undefined,
       sort_order: toOptionalInteger(image?.sort_order),
-    });
+    };
+
+    const matchedById = imageId === undefined ? undefined : imagesById.get(imageId);
+    const matchedByUrl = imagesByUrl.get(imageUrl);
+    let target = matchedById ?? matchedByUrl;
+
+    if (matchedById && matchedByUrl && matchedById !== matchedByUrl) {
+      target = mergeImages(matchedById, matchedByUrl);
+    }
+
+    if (!target) {
+      target = {};
+      normalizedImages.push(target);
+    }
+
+    applyImageValues(target, nextImage);
   }
 
-  return [...entries.values()].sort((left, right) => {
+  return normalizedImages.map((image) => ({
+    ...(image.image_id === undefined ? {} : { image_id: image.image_id }),
+    image_url: image.image_url ?? `image-${image.image_id}`,
+    ...(image.description === undefined ? {} : { description: image.description }),
+    ...(image.is_thumbnail === undefined ? {} : { is_thumbnail: image.is_thumbnail }),
+    ...(image.sort_order === undefined ? {} : { sort_order: image.sort_order }),
+  })).sort((left, right) => {
     const sortDifference = (left.sort_order ?? 0) - (right.sort_order ?? 0);
-    return sortDifference !== 0 ? sortDifference : left.image_url.localeCompare(right.image_url);
+    if (sortDifference !== 0) {
+      return sortDifference;
+    }
+
+    if ((left.image_id ?? 0) !== (right.image_id ?? 0)) {
+      return (left.image_id ?? 0) - (right.image_id ?? 0);
+    }
+
+    return left.image_url.localeCompare(right.image_url);
   });
 }
 

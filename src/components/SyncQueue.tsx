@@ -24,7 +24,7 @@ export default function SyncQueue() {
     setRunError(null);
 
     try {
-      const result = await processPendingSyncJobs({ limit: 10 });
+      const result = await processPendingSyncJobs({ limit: 25 });
       if (result.skipped) {
         setRunError(result.reason);
       } else if (result.processed === 0) {

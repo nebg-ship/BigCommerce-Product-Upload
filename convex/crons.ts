@@ -7,7 +7,7 @@ crons.interval(
   "process bigcommerce sync queue",
   { minutes: 1 },
   api.syncProcessor.processPendingSyncJobs,
-  { limit: 10 },
+  { limit: 25 },
 );
 
 export default crons;

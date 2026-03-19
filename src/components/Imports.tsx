@@ -4,7 +4,19 @@ import { UploadCloud, FileText, CheckCircle2, AlertCircle, ChevronDown, ChevronU
 import { useQuery, useAction } from "convex/react";
 import { api } from "../../convex/_generated/api";
 
-const NON_SELECTABLE_UPDATE_HEADERS = new Set(['Product ID', 'Code', 'Item Type']);
+const NON_SELECTABLE_UPDATE_HEADERS = new Set([
+  'Product ID',
+  'Code',
+  'Item Type',
+  'Image URL',
+]);
+
+function isNonSelectableUpdateHeader(header: string) {
+  return NON_SELECTABLE_UPDATE_HEADERS.has(header) ||
+    /^Product Image ID - \d+$/.test(header) ||
+    /^Product Image URL - \d+$/.test(header) ||
+    /^Product Image File - \d+$/.test(header);
+}
 
 export default function Imports() {
   const imports = useQuery(api.imports.getImports);
@@ -12,6 +24,7 @@ export default function Imports() {
 
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
+  const [uploadResult, setUploadResult] = useState<string | null>(null);
   const [expandedImport, setExpandedImport] = useState<string | null>(null);
   const [importType, setImportType] = useState<'update' | 'delete'>('update');
   const [pendingUpload, setPendingUpload] = useState<{
@@ -30,6 +43,7 @@ export default function Imports() {
   const handleImportTypeChange = (nextImportType: 'update' | 'delete') => {
     setImportType(nextImportType);
     setUploadError(null);
+    setUploadResult(null);
     resetPendingUpload();
     if (fileInputRef.current) {
       fileInputRef.current.value = '';
@@ -39,6 +53,7 @@ export default function Imports() {
   const processUpload = async (filename: string, content: string, fields?: string[]) => {
     setUploading(true);
     setUploadError(null);
+    setUploadResult(null);
 
     try {
       const res = await processCsv({
@@ -52,6 +67,9 @@ export default function Imports() {
         return;
       }
 
+      setUploadResult(
+        `Processed ${res.validCount} valid row${res.validCount === 1 ? '' : 's'} and ${res.invalidCount} invalid. ${res.changedRowCount} row${res.changedRowCount === 1 ? '' : 's'} changed, ${res.unchangedRowCount} unchanged, ${res.syncJobsCreatedCount} sync job${res.syncJobsCreatedCount === 1 ? '' : 's'} created.`,
+      );
       resetPendingUpload();
     } catch (err: any) {
       console.error(err);
@@ -88,7 +106,7 @@ export default function Imports() {
       }
 
       if (importType === 'update') {
-        const selectableHeaders = headers.filter((header) => !NON_SELECTABLE_UPDATE_HEADERS.has(header));
+        const selectableHeaders = headers.filter((header) => !isNonSelectableUpdateHeader(header));
         if (selectableHeaders.length === 0) {
           setUploadError('No updateable fields were found in this CSV.');
           setUploading(false);
@@ -155,6 +173,12 @@ export default function Imports() {
       animate={{ opacity: 1 }}
       className="max-w-5xl mx-auto space-y-8"
     >
+      {uploadResult && (
+        <div className="bg-emerald-50 border border-emerald-200 text-emerald-700 px-4 py-3 rounded-lg">
+          <p className="text-sm font-medium">{uploadResult}</p>
+        </div>
+      )}
+
       {uploadError && (
         <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-lg flex items-center gap-2">
           <AlertCircle className="w-5 h-5 shrink-0" />
@@ -214,7 +238,7 @@ export default function Imports() {
           <p className="text-zinc-500 text-sm max-w-md mx-auto">
             {importType === 'delete'
               ? 'Drag and drop your CSV here. The file must contain at least "Product ID". Products found in the CSV will be deleted.'
-              : 'Drag and drop your catalog CSV here. After upload, pick the fields you want to update. "Product ID" or "Code" is used to match existing products. "Item Type" is optional if present. Use "Product Images" as JSON, or the single-image columns "Image URL", "Image Description", "Image Sort Order", and "Image Is Thumbnail".'}
+              : 'Drag and drop your catalog CSV here. After upload, pick the fields you want to update. "Product ID" or "Code" is used to match existing products. "Item Type" is optional if present. Image imports support numbered columns such as "Product Image ID - 1", "- 2", "- 3", and matching description/sort/thumbnail fields.'}
           </p>
         </div>
 
@@ -268,7 +292,7 @@ export default function Imports() {
 
             <div className="flex items-center justify-between gap-4">
               <p className="text-xs text-zinc-500">
-                Helper columns such as `Product ID`, `Code`, and `Image URL` are still used automatically when needed.
+                Helper columns such as `Product ID`, `Code`, `Product Image ID - N`, and image URL/file columns are still used automatically when needed.
               </p>
               <button
                 type="button"
@@ -315,6 +339,11 @@ export default function Imports() {
                         <CheckCircle2 className="w-4 h-4" />
                         {run.valid_row_count} Valid
                       </div>
+                      {(run.changed_row_count !== undefined || run.sync_jobs_created_count !== undefined) && (
+                        <div className="text-xs text-zinc-500 mt-1">
+                          {run.changed_row_count ?? 0} changed, {run.unchanged_row_count ?? 0} unchanged, {run.sync_jobs_created_count ?? 0} sync jobs
+                        </div>
+                      )}
                       {run.invalid_row_count > 0 && (
                         <div className="flex items-center gap-2 text-sm text-red-600 font-medium mt-1">
                           <AlertCircle className="w-4 h-4" />

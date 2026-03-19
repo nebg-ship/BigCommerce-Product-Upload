@@ -3,7 +3,7 @@ import { internal } from "./_generated/api";
 import type { Doc, Id } from "./_generated/dataModel";
 import { v } from "convex/values";
 
-const DEFAULT_SYNC_BATCH_SIZE = 10;
+const DEFAULT_SYNC_BATCH_SIZE = 25;
 const MAX_SYNC_BATCH_SIZE = 25;
 const MAX_SYNC_ATTEMPTS = 5;
 const ACTIONABLE_SYNC_STATUSES = ["pending", "processing", "failed", "dead"] as const;
@@ -16,6 +16,14 @@ type VariantRecord = Doc<"variants">;
 type ProductSnapshot = {
   product: ProductRecord;
   variants: VariantRecord[];
+};
+
+type MutableProductImage = {
+  image_id?: number;
+  image_url?: string;
+  description?: string;
+  is_thumbnail?: boolean;
+  sort_order?: number;
 };
 
 type BigCommerceProduct = {
@@ -299,30 +307,120 @@ function normalizeLocalImages(images: ProductRecord["images"] | undefined) {
     return undefined;
   }
 
-  const normalizedImages = new Map<string, {
-    image_url: string;
-    description?: string;
-    is_thumbnail?: boolean;
-    sort_order?: number;
-  }>();
+  const normalizedImages: MutableProductImage[] = [];
+  const imagesById = new Map<number, MutableProductImage>();
+  const imagesByUrl = new Map<string, MutableProductImage>();
+
+  const unlinkImage = (image: MutableProductImage) => {
+    if (image.image_id !== undefined && imagesById.get(image.image_id) === image) {
+      imagesById.delete(image.image_id);
+    }
+
+    if (image.image_url && imagesByUrl.get(image.image_url) === image) {
+      imagesByUrl.delete(image.image_url);
+    }
+  };
+
+  const linkImage = (image: MutableProductImage) => {
+    if (image.image_id !== undefined) {
+      imagesById.set(image.image_id, image);
+    }
+
+    if (image.image_url) {
+      imagesByUrl.set(image.image_url, image);
+    }
+  };
+
+  const applyImageValues = (target: MutableProductImage, source: MutableProductImage) => {
+    unlinkImage(target);
+
+    if (source.image_id !== undefined) {
+      target.image_id = source.image_id;
+    }
+
+    if (source.image_url !== undefined) {
+      target.image_url = source.image_url;
+    }
+
+    if (source.description !== undefined) {
+      target.description = source.description;
+    }
+
+    if (source.is_thumbnail !== undefined) {
+      target.is_thumbnail = source.is_thumbnail;
+    }
+
+    if (source.sort_order !== undefined) {
+      target.sort_order = source.sort_order;
+    }
+
+    linkImage(target);
+  };
+
+  const mergeImages = (target: MutableProductImage, source: MutableProductImage) => {
+    if (target === source) {
+      return target;
+    }
+
+    applyImageValues(target, source);
+    unlinkImage(source);
+
+    const sourceIndex = normalizedImages.indexOf(source);
+    if (sourceIndex >= 0) {
+      normalizedImages.splice(sourceIndex, 1);
+    }
+
+    return target;
+  };
 
   for (const image of images ?? []) {
     const imageUrl = normalizeImageUrl(image.image_url);
-    if (!imageUrl) {
+    const imageId = image.image_id;
+    if (!imageUrl && imageId === undefined) {
       continue;
     }
 
-    normalizedImages.set(imageUrl, {
-      image_url: imageUrl,
+    const nextImage: MutableProductImage = {
+      ...(imageId === undefined ? {} : { image_id: imageId }),
+      ...(imageUrl === null ? {} : { image_url: imageUrl }),
       description: image.description?.trim() || undefined,
       is_thumbnail: typeof image.is_thumbnail === "boolean" ? image.is_thumbnail : undefined,
       sort_order: image.sort_order,
-    });
+    };
+
+    const matchedById = imageId === undefined ? undefined : imagesById.get(imageId);
+    const matchedByUrl = imageUrl === null ? undefined : imagesByUrl.get(imageUrl);
+    let target = matchedById ?? matchedByUrl;
+
+    if (matchedById && matchedByUrl && matchedById !== matchedByUrl) {
+      target = mergeImages(matchedById, matchedByUrl);
+    }
+
+    if (!target) {
+      target = {};
+      normalizedImages.push(target);
+    }
+
+    applyImageValues(target, nextImage);
   }
 
-  return [...normalizedImages.values()].sort((left, right) => {
+  return normalizedImages.map((image) => ({
+    ...(image.image_id === undefined ? {} : { image_id: image.image_id }),
+    image_url: image.image_url ?? `image-${image.image_id}`,
+    ...(image.description === undefined ? {} : { description: image.description }),
+    ...(image.is_thumbnail === undefined ? {} : { is_thumbnail: image.is_thumbnail }),
+    ...(image.sort_order === undefined ? {} : { sort_order: image.sort_order }),
+  })).sort((left, right) => {
     const sortDifference = (left.sort_order ?? 0) - (right.sort_order ?? 0);
-    return sortDifference !== 0 ? sortDifference : left.image_url.localeCompare(right.image_url);
+    if (sortDifference !== 0) {
+      return sortDifference;
+    }
+
+    if ((left.image_id ?? 0) !== (right.image_id ?? 0)) {
+      return (left.image_id ?? 0) - (right.image_id ?? 0);
+    }
+
+    return left.image_url.localeCompare(right.image_url);
   });
 }
 
@@ -652,10 +750,10 @@ async function syncRemoteImages(
 
   const normalizedLocalImages = normalizeLocalImages(localImages) ?? [];
   const remoteImages = await fetchRemoteImages(client, productId);
-  const remoteImagesByUrl = new Map<string, BigCommerceImage[]>();
-
-  for (const remoteImage of remoteImages) {
-    const imageUrl = normalizeImageUrl(
+  const remoteImageEntries = remoteImages.map((remoteImage) => ({
+    remoteImage,
+    image_id: remoteImage.id,
+    image_url: normalizeImageUrl(
       remoteImage.image_url ??
       remoteImage.standard_url ??
       remoteImage.url_standard ??
@@ -664,19 +762,32 @@ async function syncRemoteImages(
       remoteImage.thumbnail_url ??
       remoteImage.url_thumbnail ??
       remoteImage.image_file,
-    );
-    if (!imageUrl) {
-      continue;
-    }
-
-    const existing = remoteImagesByUrl.get(imageUrl) ?? [];
-    existing.push(remoteImage);
-    remoteImagesByUrl.set(imageUrl, existing);
-  }
+    ),
+    description: remoteImage.description?.trim() || "",
+    is_thumbnail: remoteImage.is_thumbnail ?? false,
+    sort_order: remoteImage.sort_order ?? 0,
+  }));
+  const handledRemoteImageIds = new Set<number>();
 
   for (const localImage of normalizedLocalImages) {
-    const remoteEntries = remoteImagesByUrl.get(localImage.image_url) ?? [];
-    const [matchedRemoteImage, ...duplicateRemoteImages] = remoteEntries;
+    const matchingRemoteImages = remoteImageEntries
+      .filter((entry) => {
+        if (handledRemoteImageIds.has(entry.remoteImage.id)) {
+          return false;
+        }
+
+        if (localImage.image_id !== undefined && entry.image_id === localImage.image_id) {
+          return true;
+        }
+
+        return entry.image_url !== null && entry.image_url === localImage.image_url;
+      })
+      .sort((left, right) => {
+        const leftIdMatch = localImage.image_id !== undefined && left.image_id === localImage.image_id ? 1 : 0;
+        const rightIdMatch = localImage.image_id !== undefined && right.image_id === localImage.image_id ? 1 : 0;
+        return rightIdMatch - leftIdMatch;
+      });
+    const [matchedRemoteImage, ...duplicateRemoteImages] = matchingRemoteImages;
 
     if (!matchedRemoteImage) {
       await bigCommerceRequest(
@@ -695,14 +806,16 @@ async function syncRemoteImages(
       continue;
     }
 
+    handledRemoteImageIds.add(matchedRemoteImage.remoteImage.id);
+
     if (
-      (matchedRemoteImage.description ?? "") !== (localImage.description ?? "") ||
-      (matchedRemoteImage.is_thumbnail ?? false) !== (localImage.is_thumbnail ?? false) ||
-      (matchedRemoteImage.sort_order ?? 0) !== (localImage.sort_order ?? 0)
+      matchedRemoteImage.description !== (localImage.description ?? "") ||
+      matchedRemoteImage.is_thumbnail !== (localImage.is_thumbnail ?? false) ||
+      matchedRemoteImage.sort_order !== (localImage.sort_order ?? 0)
     ) {
       await bigCommerceRequest(
         client,
-        `/v3/catalog/products/${productId}/images/${matchedRemoteImage.id}`,
+        `/v3/catalog/products/${productId}/images/${matchedRemoteImage.remoteImage.id}`,
         {
           body: JSON.stringify({
             description: localImage.description ?? "",
@@ -715,24 +828,25 @@ async function syncRemoteImages(
     }
 
     for (const duplicateRemoteImage of duplicateRemoteImages) {
+      handledRemoteImageIds.add(duplicateRemoteImage.remoteImage.id);
       await bigCommerceRequest(
         client,
-        `/v3/catalog/products/${productId}/images/${duplicateRemoteImage.id}`,
+        `/v3/catalog/products/${productId}/images/${duplicateRemoteImage.remoteImage.id}`,
         { method: "DELETE" },
       );
     }
-
-    remoteImagesByUrl.delete(localImage.image_url);
   }
 
-  for (const obsoleteRemoteImages of remoteImagesByUrl.values()) {
-    for (const remoteImage of obsoleteRemoteImages) {
-      await bigCommerceRequest(
-        client,
-        `/v3/catalog/products/${productId}/images/${remoteImage.id}`,
-        { method: "DELETE" },
-      );
+  for (const remoteImageEntry of remoteImageEntries) {
+    if (handledRemoteImageIds.has(remoteImageEntry.remoteImage.id)) {
+      continue;
     }
+
+    await bigCommerceRequest(
+      client,
+      `/v3/catalog/products/${productId}/images/${remoteImageEntry.remoteImage.id}`,
+      { method: "DELETE" },
+    );
   }
 }
 

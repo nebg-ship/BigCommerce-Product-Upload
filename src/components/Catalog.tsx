@@ -6,8 +6,8 @@ import { useQuery, useMutation, useAction, usePaginatedQuery } from "convex/reac
 import { api } from "../../convex/_generated/api";
 
 const CONVEX_CONNECTION_LOST_MESSAGE = 'Connection lost while action was in flight';
-const MAX_PULL_RETRIES = 3;
-const RETRY_DELAY_MS = 1500;
+const MAX_PULL_RETRIES = 5;
+const RETRY_DELAY_MS = 2000;
 
 function getErrorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error ?? 'Unknown error');
@@ -204,11 +204,11 @@ export default function Catalog() {
         </div>
         <div className="bg-white p-5 rounded-xl shadow-sm border border-zinc-200 flex flex-col">
           <span className="text-sm font-medium text-zinc-500 mb-1">Active Products</span>
-          <span className="text-3xl font-semibold text-zinc-900">{stats === undefined ? '-' : stats.activeProducts.toLocaleString()}</span>
+          <span className="text-3xl font-semibold text-zinc-900">{stats === undefined || stats.activeProducts === null ? '-' : stats.activeProducts.toLocaleString()}</span>
         </div>
         <div className="bg-white p-5 rounded-xl shadow-sm border border-zinc-200 flex flex-col">
           <span className="text-sm font-medium text-zinc-500 mb-1">Visible on Storefront</span>
-          <span className="text-3xl font-semibold text-zinc-900">{stats === undefined ? '-' : stats.visibleProducts.toLocaleString()}</span>
+          <span className="text-3xl font-semibold text-zinc-900">{stats === undefined || stats.visibleProducts === null ? '-' : stats.visibleProducts.toLocaleString()}</span>
         </div>
       </div>
 

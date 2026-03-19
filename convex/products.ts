@@ -6,13 +6,26 @@ import { v } from "convex/values";
 type ProductRecord = Doc<"products">;
 type VariantRecord = Doc<"variants">;
 
-async function countQuery(query: { collect: () => Promise<unknown[]> }): Promise<number> {
-  const queryWithCount = query as { count?: () => Promise<number> };
+async function tryCollectCount(query: { collect: () => Promise<unknown[]> }): Promise<number | null> {
+  try {
+    return (await query.collect()).length;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message.includes("Too many bytes read in a single function execution")) {
+      return null;
+    }
+
+    throw error;
+  }
+}
+
+async function countAll(query: { count?: () => Promise<number>; collect: () => Promise<unknown[]> }) {
+  const queryWithCount = query as { count?: () => Promise<number>; collect: () => Promise<unknown[]> };
   if (typeof queryWithCount.count === "function") {
     return await queryWithCount.count();
   }
 
-  return (await query.collect()).length;
+  return await tryCollectCount(queryWithCount);
 }
 
 function toFrontendProduct(product: ProductRecord, variants: VariantRecord[]) {
@@ -46,13 +59,13 @@ export const getDashboardStats = query({
       failedSyncs,
       deadSyncs,
     ] = await Promise.all([
-      countQuery(ctx.db.query("products")),
-      countQuery(ctx.db.query("variants")),
-      countQuery(ctx.db.query("products").withIndex("by_status", (q) => q.eq("status", "active"))),
-      countQuery(ctx.db.query("products").withIndex("by_visibility", (q) => q.eq("is_visible", 1))),
-      countQuery(ctx.db.query("sync_queue").withIndex("by_status", (q) => q.eq("status", "pending"))),
-      countQuery(ctx.db.query("sync_queue").withIndex("by_status", (q) => q.eq("status", "failed"))),
-      countQuery(ctx.db.query("sync_queue").withIndex("by_status", (q) => q.eq("status", "dead"))),
+      countAll(ctx.db.query("products") as { count?: () => Promise<number>; collect: () => Promise<unknown[]> }),
+      countAll(ctx.db.query("variants") as { count?: () => Promise<number>; collect: () => Promise<unknown[]> }),
+      tryCollectCount(ctx.db.query("products").withIndex("by_status", (q) => q.eq("status", "active"))),
+      tryCollectCount(ctx.db.query("products").withIndex("by_visibility", (q) => q.eq("is_visible", 1))),
+      tryCollectCount(ctx.db.query("sync_queue").withIndex("by_status", (q) => q.eq("status", "pending"))),
+      tryCollectCount(ctx.db.query("sync_queue").withIndex("by_status", (q) => q.eq("status", "failed"))),
+      tryCollectCount(ctx.db.query("sync_queue").withIndex("by_status", (q) => q.eq("status", "dead"))),
     ]);
 
     return {
@@ -61,7 +74,7 @@ export const getDashboardStats = query({
       activeProducts,
       visibleProducts,
       pendingSyncs,
-      failedSyncs: failedSyncs + deadSyncs,
+      failedSyncs: (failedSyncs ?? 0) + (deadSyncs ?? 0),
     };
   },
 });
