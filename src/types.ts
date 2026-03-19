@@ -35,6 +35,12 @@ export interface Product {
   order_quantity_minimum?: number | null;
   order_quantity_maximum?: number | null;
   custom_fields?: Array<{ name: string; value: string }> | null;
+  images?: Array<{
+    image_url: string;
+    description?: string | null;
+    is_thumbnail?: boolean | null;
+    sort_order?: number | null;
+  }> | null;
   version?: number;
   sync_needed: number;
   updated_at: string;

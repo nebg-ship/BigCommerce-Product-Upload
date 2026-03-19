@@ -8,10 +8,11 @@ export const processCsvAction = action({
   args: {
     filename: v.string(),
     content: v.string(),
-    importType: v.string()
+    importType: v.string(),
+    selectedFields: v.optional(v.array(v.string())),
   },
   handler: async (ctx, args) => {
-    const { filename, content, importType } = args;
+    const { filename, content, importType, selectedFields } = args;
     
     let records: any[];
     try {
@@ -31,7 +32,8 @@ export const processCsvAction = action({
     const result = await ctx.runMutation(internal.imports.processRecords, {
       filename,
       records: JSON.stringify(records),
-      importType
+      importType,
+      selectedFields,
     });
 
     return result;

@@ -9,6 +9,13 @@ type ProductCustomField = {
   value: string;
 };
 
+type ProductImage = {
+  image_url: string;
+  description?: string;
+  is_thumbnail?: boolean;
+  sort_order?: number;
+};
+
 function readString(value: unknown): string | undefined {
   if (value === null || value === undefined) {
     return undefined;
@@ -30,6 +37,31 @@ function readNumber(value: unknown): number | undefined {
 function readInteger(value: unknown): number | undefined {
   const parsed = readNumber(value);
   return parsed === undefined ? undefined : Math.trunc(parsed);
+}
+
+function readBooleanFlag(value: unknown): boolean | undefined {
+  if (value === null || value === undefined) {
+    return undefined;
+  }
+
+  if (typeof value === "boolean") {
+    return value;
+  }
+
+  const normalized = String(value).trim().toLowerCase();
+  if (!normalized) {
+    return undefined;
+  }
+
+  if (["1", "true", "yes", "y"].includes(normalized)) {
+    return true;
+  }
+
+  if (["0", "false", "no", "n"].includes(normalized)) {
+    return false;
+  }
+
+  return undefined;
 }
 
 function normalizeProductCondition(value: unknown): string | undefined {
@@ -81,6 +113,28 @@ function normalizeProductCustomFields(fields: ProductCustomField[]): ProductCust
   return [...entries.entries()]
     .sort(([leftName], [rightName]) => leftName.localeCompare(rightName))
     .map(([name, fieldValue]) => ({ name, value: fieldValue }));
+}
+
+function normalizeProductImages(images: ProductImage[]): ProductImage[] {
+  const entries = new Map<string, ProductImage>();
+  for (const image of images) {
+    const imageUrl = readString(image.image_url);
+    if (!imageUrl) {
+      continue;
+    }
+
+    entries.set(imageUrl, {
+      image_url: imageUrl,
+      description: readString(image.description),
+      is_thumbnail: typeof image.is_thumbnail === "boolean" ? image.is_thumbnail : undefined,
+      sort_order: readInteger(image.sort_order),
+    });
+  }
+
+  return [...entries.values()].sort((left, right) => {
+    const sortDifference = (left.sort_order ?? 0) - (right.sort_order ?? 0);
+    return sortDifference !== 0 ? sortDifference : left.image_url.localeCompare(right.image_url);
+  });
 }
 
 function parseProductCustomFields(value: unknown): ProductCustomField[] | undefined {
@@ -149,6 +203,97 @@ function parseProductCustomFields(value: unknown): ProductCustomField[] | undefi
   );
 }
 
+function parseProductImages(value: unknown): ProductImage[] | undefined {
+  if (value === null || value === undefined) {
+    return undefined;
+  }
+
+  const raw = String(value).trim();
+  if (!raw) {
+    return [];
+  }
+
+  if (raw.startsWith("[") || raw.startsWith("{")) {
+    try {
+      const parsed = JSON.parse(raw);
+      const entries = Array.isArray(parsed) ? parsed : [parsed];
+      return normalizeProductImages(
+        entries.flatMap((entry) => {
+          if (!entry || typeof entry !== "object") {
+            return [];
+          }
+
+          const record = entry as Record<string, unknown>;
+          const imageUrl = readString(record.image_url ?? record.imageUrl ?? record.url);
+          if (!imageUrl) {
+            return [];
+          }
+
+          return [{
+            image_url: imageUrl,
+            description: readString(record.description ?? record.alt_text ?? record.alt),
+            is_thumbnail: readBooleanFlag(record.is_thumbnail ?? record.isThumbnail),
+            sort_order: readInteger(record.sort_order ?? record.sortOrder),
+          }];
+        }),
+      );
+    } catch (error: any) {
+      throw new Error(`Could not parse Product Images JSON: ${error.message || "Invalid JSON."}`);
+    }
+  }
+
+  return normalizeProductImages(raw
+    .split(/\r?\n/)
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .map((entry) => {
+      const [imageUrl, description, sortOrder, isThumbnail] = entry.split("|").map((part) => part.trim());
+      return {
+        image_url: imageUrl,
+        description: readString(description),
+        sort_order: readInteger(sortOrder),
+        is_thumbnail: readBooleanFlag(isThumbnail),
+      };
+    }));
+}
+
+function arraysEqual(left: unknown, right: unknown) {
+  return JSON.stringify(left ?? []) === JSON.stringify(right ?? []);
+}
+
+function hasColumn(record: Record<string, unknown>, column: string) {
+  return Object.prototype.hasOwnProperty.call(record, column);
+}
+
+const ALWAYS_INCLUDED_UPDATE_COLUMNS = new Set(["Product ID", "Code", "Item Type"]);
+const IMAGE_SELECTION_COLUMNS = new Set(["Image Description", "Image Sort Order", "Image Is Thumbnail"]);
+
+function filterRecordForSelectedFields(
+  record: Record<string, unknown>,
+  importType: string,
+  selectedFields: string[] | undefined,
+) {
+  if (importType !== "update" || !selectedFields) {
+    return record;
+  }
+
+  const selectedFieldSet = new Set(selectedFields);
+  const includeImageUrl = [...IMAGE_SELECTION_COLUMNS].some((column) => selectedFieldSet.has(column));
+  const filteredRecord: Record<string, unknown> = {};
+
+  for (const [key, value] of Object.entries(record)) {
+    if (
+      ALWAYS_INCLUDED_UPDATE_COLUMNS.has(key) ||
+      selectedFieldSet.has(key) ||
+      (key === "Image URL" && includeImageUrl)
+    ) {
+      filteredRecord[key] = value;
+    }
+  }
+
+  return filteredRecord;
+}
+
 function getProductSyncIdentifier(product: ProductRecord): string {
   return product.external_product_id || product._id;
 }
@@ -211,10 +356,15 @@ export const processRecords = internalMutation({
   args: {
     filename: v.string(),
     records: v.string(), // JSON string to avoid complex types
-    importType: v.string()
+    importType: v.string(),
+    selectedFields: v.optional(v.array(v.string())),
   },
   handler: async (ctx, args) => {
     const records = JSON.parse(args.records);
+    if (args.importType === "update" && args.selectedFields && args.selectedFields.length === 0) {
+      throw new Error("Select at least one field to update.");
+    }
+
     let validCount = 0;
     let invalidCount = 0;
     const errors: { row: number; error: string; data: any }[] = [];
@@ -222,8 +372,8 @@ export const processRecords = internalMutation({
     let rowIndex = 0;
     for (const record of records) {
       rowIndex++;
-      const itemType = record['Item Type'];
-      if (itemType !== 'Product') continue;
+      const itemType = readString(record['Item Type']);
+      if (itemType && itemType !== 'Product') continue;
 
       const externalId = readString(record['Product ID']);
       if (args.importType === 'delete' && !externalId) {
@@ -265,215 +415,229 @@ export const processRecords = internalMutation({
         continue;
       }
 
-      const name = readString(record['Name']);
-      if (!name) {
-        invalidCount++;
-        errors.push({ row: rowIndex, error: 'Missing Name', data: record });
-        continue;
-      }
-
-      const description = readString(record['Description']);
-      const brand = readString(record['Brand']);
-      const isVisible = parseInt(record['Product Visible']) === 1 ? 1 : 0;
-      const status = isVisible ? 'active' : 'inactive';
-      const price = parseFloat(record['Price']) || 0;
-      const costPrice = readNumber(record['Cost Price']);
-      const retailPrice = readNumber(record['Retail Price']);
-      const salePrice = readNumber(record['Sale Price']);
-      const sku = readString(record['Code']);
-      const inventoryLevel = parseInt(record['Stock Level']) || 0;
-      const weight = readNumber(record['Weight']);
-      const width = readNumber(record['Width']);
-      const height = readNumber(record['Height']);
-      const depth = readNumber(record['Depth']);
-      const pageTitle = readString(record['Page Title']);
-      const metaKeywords = readString(record['Meta Keywords']);
-      const metaDescription = readString(record['Meta Description']);
-      const sortOrder = readInteger(record['Sort Order']);
-      const searchKeywords = readString(record['Search Keywords']);
-      const condition = normalizeProductCondition(record['Product Condition']);
-      const isConditionShown = readInteger(record['Show Product Condition']);
-      const allowPurchases = readInteger(record['Allow Purchases']);
-      const inventoryWarningLevel = readInteger(record['Low Stock Level']);
-      const categoryString = readString(record['Category String']);
-      const categoryIds = parseCategoryIdsFromDetails(record['Category Details']);
-      const availabilityDescription = readString(record['Product Availability']);
-      const warranty = readString(record['Warranty']);
-      const freeShippingValue = readInteger(record['Free Shipping']);
-      const isFreeShipping = freeShippingValue === undefined ? undefined : freeShippingValue === 1 ? 1 : 0;
-      const fixedCostShippingPrice = readNumber(record['Fixed Shipping Price']);
-      const orderQuantityMinimum = readInteger(record['Minimum Purchase Quantity']);
-      const orderQuantityMaximum = readInteger(record['Maximum Purchase Quantity']);
-      const customFields = parseProductCustomFields(record['Product Custom Fields']);
-      const upc = readString(record['Product UPC/EAN']);
-      const mpn = readString(record['Manufacturer Part Number']);
-
       try {
+        const row = filterRecordForSelectedFields(
+          record as Record<string, unknown>,
+          args.importType,
+          args.selectedFields,
+        );
+        const name = readString(row['Name']);
+        const description = readString(row['Description']);
+        const brand = readString(row['Brand']);
+        const isVisible = hasColumn(row, 'Product Visible') ? (readInteger(row['Product Visible']) === 1 ? 1 : 0) : undefined;
+        const status = isVisible === undefined ? undefined : isVisible ? 'active' : 'inactive';
+        const price = readNumber(row['Price']);
+        const costPrice = readNumber(row['Cost Price']);
+        const retailPrice = readNumber(row['Retail Price']);
+        const salePrice = readNumber(row['Sale Price']);
+        const sku = readString(row['Code']);
+        const inventoryLevel = readInteger(row['Stock Level']);
+        const weight = readNumber(row['Weight']);
+        const width = readNumber(row['Width']);
+        const height = readNumber(row['Height']);
+        const depth = readNumber(row['Depth']);
+        const pageTitle = readString(row['Page Title']);
+        const metaKeywords = readString(row['Meta Keywords']);
+        const metaDescription = readString(row['Meta Description']);
+        const sortOrder = readInteger(row['Sort Order']);
+        const searchKeywords = readString(row['Search Keywords']);
+        const condition = hasColumn(row, 'Product Condition') ? normalizeProductCondition(row['Product Condition']) : undefined;
+        const isConditionShown = readInteger(row['Show Product Condition']);
+        const allowPurchases = readInteger(row['Allow Purchases']);
+        const inventoryWarningLevel = readInteger(row['Low Stock Level']);
+        const categoryString = readString(row['Category String']);
+        const categoryIds = parseCategoryIdsFromDetails(row['Category Details']);
+        const availabilityDescription = readString(row['Product Availability']);
+        const warranty = readString(row['Warranty']);
+        const freeShippingValue = readInteger(row['Free Shipping']);
+        const isFreeShipping = freeShippingValue === undefined ? undefined : freeShippingValue === 1 ? 1 : 0;
+        const fixedCostShippingPrice = readNumber(row['Fixed Shipping Price']);
+        const orderQuantityMinimum = readInteger(row['Minimum Purchase Quantity']);
+        const orderQuantityMaximum = readInteger(row['Maximum Purchase Quantity']);
+        const customFields = parseProductCustomFields(row['Product Custom Fields']);
+        const productImages = hasColumn(row, 'Product Images')
+          ? parseProductImages(row['Product Images'])
+          : (
+            hasColumn(row, 'Image URL') ||
+            hasColumn(row, 'Image Description') ||
+            hasColumn(row, 'Image Sort Order') ||
+            hasColumn(row, 'Image Is Thumbnail')
+          )
+            ? parseProductImages(JSON.stringify([{
+                image_url: row['Image URL'],
+                description: row['Image Description'],
+                sort_order: row['Image Sort Order'],
+                is_thumbnail: row['Image Is Thumbnail'],
+              }]))
+            : undefined;
+        const upc = readString(row['Product UPC/EAN']);
+        const mpn = readString(row['Manufacturer Part Number']);
+
         let product = await getProductForImport(ctx, externalId, sku);
-        if (categoryString && categoryIds === undefined) {
+        if (product && !externalId && !sku) {
+          throw new Error('Updates require either Product ID or Code.');
+        }
+
+        if (!product && !name) {
+          throw new Error('Missing Name for product creation.');
+        }
+
+        if (hasColumn(row, 'Category String') && !hasColumn(row, 'Category Details') && categoryString) {
           throw new Error('Category updates require the Category Details column with category IDs.');
         }
 
-        const availability = allowPurchases === undefined
-          ? product?.availability
-          : allowPurchases === 0
+        const availability = hasColumn(row, 'Allow Purchases')
+          ? allowPurchases === 0
             ? 'disabled'
             : product?.availability === 'preorder'
               ? 'preorder'
-              : 'available';
+              : 'available'
+          : undefined;
         const productChanges: Record<string, any> = {};
         let productAction = 'create';
         let productIdentifier: string;
+        const now = new Date().toISOString();
 
         if (product) {
           productAction = 'update';
-          if (product.name !== name) productChanges.name = { old: product.name, new: name };
-          if (product.description !== description) productChanges.description = { old: product.description, new: description };
-          if (product.brand !== brand) productChanges.brand = { old: product.brand, new: brand };
-          if (product.status !== status) productChanges.status = { old: product.status, new: status };
-          if (product.is_visible !== isVisible) productChanges.is_visible = { old: product.is_visible, new: isVisible };
-          if (product.default_price !== price) productChanges.default_price = { old: product.default_price, new: price };
-          if (product.cost_price !== costPrice) productChanges.cost_price = { old: product.cost_price, new: costPrice };
-          if (product.retail_price !== retailPrice) productChanges.retail_price = { old: product.retail_price, new: retailPrice };
-          if (product.sale_price !== salePrice) productChanges.sale_price = { old: product.sale_price, new: salePrice };
-          if (product.weight !== weight) productChanges.weight = { old: product.weight, new: weight };
-          if (product.width !== width) productChanges.width = { old: product.width, new: width };
-          if (product.height !== height) productChanges.height = { old: product.height, new: height };
-          if (product.depth !== depth) productChanges.depth = { old: product.depth, new: depth };
-          if (product.page_title !== pageTitle) productChanges.page_title = { old: product.page_title, new: pageTitle };
-          if (product.meta_keywords !== metaKeywords) productChanges.meta_keywords = { old: product.meta_keywords, new: metaKeywords };
-          if (product.meta_description !== metaDescription) productChanges.meta_description = { old: product.meta_description, new: metaDescription };
-          if (product.sort_order !== sortOrder) productChanges.sort_order = { old: product.sort_order, new: sortOrder };
-          if (product.search_keywords !== searchKeywords) productChanges.search_keywords = { old: product.search_keywords, new: searchKeywords };
-          if (product.condition !== condition) productChanges.condition = { old: product.condition, new: condition };
-          if (product.is_condition_shown !== isConditionShown) productChanges.is_condition_shown = { old: product.is_condition_shown, new: isConditionShown };
-          if (product.allow_purchases !== allowPurchases) productChanges.allow_purchases = { old: product.allow_purchases, new: allowPurchases };
-          if (product.availability !== availability) productChanges.availability = { old: product.availability, new: availability };
-          if (product.availability_description !== availabilityDescription) productChanges.availability_description = { old: product.availability_description, new: availabilityDescription };
-          if (product.inventory_warning_level !== inventoryWarningLevel) productChanges.inventory_warning_level = { old: product.inventory_warning_level, new: inventoryWarningLevel };
-          if (product.category_string !== categoryString) productChanges.category_string = { old: product.category_string, new: categoryString };
-          if (JSON.stringify(product.category_ids ?? []) !== JSON.stringify(categoryIds ?? [])) productChanges.category_ids = { old: product.category_ids, new: categoryIds };
-          if (product.warranty !== warranty) productChanges.warranty = { old: product.warranty, new: warranty };
-          if (product.is_free_shipping !== isFreeShipping) productChanges.is_free_shipping = { old: product.is_free_shipping, new: isFreeShipping };
-          if (product.fixed_cost_shipping_price !== fixedCostShippingPrice) productChanges.fixed_cost_shipping_price = { old: product.fixed_cost_shipping_price, new: fixedCostShippingPrice };
-          if (product.order_quantity_minimum !== orderQuantityMinimum) productChanges.order_quantity_minimum = { old: product.order_quantity_minimum, new: orderQuantityMinimum };
-          if (product.order_quantity_maximum !== orderQuantityMaximum) productChanges.order_quantity_maximum = { old: product.order_quantity_maximum, new: orderQuantityMaximum };
-          if (JSON.stringify(product.custom_fields ?? []) !== JSON.stringify(customFields ?? [])) productChanges.custom_fields = { old: product.custom_fields, new: customFields };
-          if (product.upc !== upc) productChanges.upc = { old: product.upc, new: upc };
-          if (product.mpn !== mpn) productChanges.mpn = { old: product.mpn, new: mpn };
-          
-          await ctx.db.patch(product._id, {
-            name,
-            description,
-            brand,
-            status,
-            is_visible: isVisible,
-            availability,
-            allow_purchases: allowPurchases,
-            availability_description: availabilityDescription,
-            condition,
-            is_condition_shown: isConditionShown,
-            default_price: price,
-            cost_price: costPrice,
-            retail_price: retailPrice,
-            sale_price: salePrice,
-            weight,
-            width,
-            height,
-            depth,
-            inventory_warning_level: inventoryWarningLevel,
-            page_title: pageTitle,
-            meta_keywords: metaKeywords,
-            meta_description: metaDescription,
-            sort_order: sortOrder,
-            search_keywords: searchKeywords,
-            category_string: categoryString,
-            category_ids: categoryIds,
-            warranty,
-            is_free_shipping: isFreeShipping,
-            fixed_cost_shipping_price: fixedCostShippingPrice,
-            order_quantity_minimum: orderQuantityMinimum,
-            order_quantity_maximum: orderQuantityMaximum,
-            custom_fields: customFields,
-            upc,
-            mpn,
-            sync_needed: 1, updated_at: new Date().toISOString()
-          });
+          const productPatch: Record<string, any> = {
+            sync_needed: 1,
+            updated_at: now,
+          };
+
+          const assignScalarField = (column: string, field: keyof ProductRecord, nextValue: unknown) => {
+            if (!hasColumn(row, column)) {
+              return;
+            }
+
+            if ((product as any)[field] !== nextValue) {
+              productChanges[field] = { old: (product as any)[field], new: nextValue };
+              productPatch[field] = nextValue;
+            }
+          };
+
+          assignScalarField('Name', 'name', name);
+          assignScalarField('Description', 'description', description);
+          assignScalarField('Brand', 'brand', brand);
+          assignScalarField('Product Visible', 'is_visible', isVisible);
+          assignScalarField('Product Visible', 'status', status);
+          assignScalarField('Price', 'default_price', price);
+          assignScalarField('Cost Price', 'cost_price', costPrice);
+          assignScalarField('Retail Price', 'retail_price', retailPrice);
+          assignScalarField('Sale Price', 'sale_price', salePrice);
+          assignScalarField('Weight', 'weight', weight);
+          assignScalarField('Width', 'width', width);
+          assignScalarField('Height', 'height', height);
+          assignScalarField('Depth', 'depth', depth);
+          assignScalarField('Page Title', 'page_title', pageTitle);
+          assignScalarField('Meta Keywords', 'meta_keywords', metaKeywords);
+          assignScalarField('Meta Description', 'meta_description', metaDescription);
+          assignScalarField('Sort Order', 'sort_order', sortOrder);
+          assignScalarField('Search Keywords', 'search_keywords', searchKeywords);
+          assignScalarField('Product Condition', 'condition', condition);
+          assignScalarField('Show Product Condition', 'is_condition_shown', isConditionShown);
+          assignScalarField('Allow Purchases', 'allow_purchases', allowPurchases);
+          assignScalarField('Allow Purchases', 'availability', availability);
+          assignScalarField('Product Availability', 'availability_description', availabilityDescription);
+          assignScalarField('Low Stock Level', 'inventory_warning_level', inventoryWarningLevel);
+          assignScalarField('Category String', 'category_string', categoryString);
+          assignScalarField('Warranty', 'warranty', warranty);
+          assignScalarField('Free Shipping', 'is_free_shipping', isFreeShipping);
+          assignScalarField('Fixed Shipping Price', 'fixed_cost_shipping_price', fixedCostShippingPrice);
+          assignScalarField('Minimum Purchase Quantity', 'order_quantity_minimum', orderQuantityMinimum);
+          assignScalarField('Maximum Purchase Quantity', 'order_quantity_maximum', orderQuantityMaximum);
+          assignScalarField('Product UPC/EAN', 'upc', upc);
+          assignScalarField('Manufacturer Part Number', 'mpn', mpn);
+
+          if (hasColumn(row, 'Category Details') && !arraysEqual(product.category_ids, categoryIds)) {
+            productChanges.category_ids = { old: product.category_ids, new: categoryIds };
+            productPatch.category_ids = categoryIds;
+          }
+
+          if (hasColumn(row, 'Product Custom Fields') && !arraysEqual(product.custom_fields, customFields)) {
+            productChanges.custom_fields = { old: product.custom_fields, new: customFields };
+            productPatch.custom_fields = customFields;
+          }
+
+          if (
+            (hasColumn(row, 'Product Images') ||
+              hasColumn(row, 'Image URL') ||
+              hasColumn(row, 'Image Description') ||
+              hasColumn(row, 'Image Sort Order') ||
+              hasColumn(row, 'Image Is Thumbnail')) &&
+            !arraysEqual(product.images, productImages)
+          ) {
+            productChanges.images = { old: product.images, new: productImages };
+            productPatch.images = productImages;
+          }
+
+          if (Object.keys(productChanges).length > 0) {
+            await ctx.db.patch(product._id, productPatch);
+          }
           productIdentifier = getProductSyncIdentifier(product);
         } else {
-          productChanges.name = { new: name };
-          productChanges.description = { new: description };
-          productChanges.brand = { new: brand };
-          productChanges.status = { new: status };
-          productChanges.is_visible = { new: isVisible };
-          productChanges.default_price = { new: price };
-          productChanges.cost_price = { new: costPrice };
-          productChanges.retail_price = { new: retailPrice };
-          productChanges.sale_price = { new: salePrice };
-          productChanges.weight = { new: weight };
-          productChanges.width = { new: width };
-          productChanges.height = { new: height };
-          productChanges.depth = { new: depth };
-          productChanges.page_title = { new: pageTitle };
-          productChanges.meta_keywords = { new: metaKeywords };
-          productChanges.meta_description = { new: metaDescription };
-          productChanges.sort_order = { new: sortOrder };
-          productChanges.search_keywords = { new: searchKeywords };
-          productChanges.condition = { new: condition };
-          productChanges.is_condition_shown = { new: isConditionShown };
-          productChanges.allow_purchases = { new: allowPurchases };
-          productChanges.availability = { new: availability };
-          productChanges.availability_description = { new: availabilityDescription };
-          productChanges.inventory_warning_level = { new: inventoryWarningLevel };
-          productChanges.category_string = { new: categoryString };
-          productChanges.category_ids = { new: categoryIds };
-          productChanges.warranty = { new: warranty };
-          productChanges.is_free_shipping = { new: isFreeShipping };
-          productChanges.fixed_cost_shipping_price = { new: fixedCostShippingPrice };
-          productChanges.order_quantity_minimum = { new: orderQuantityMinimum };
-          productChanges.order_quantity_maximum = { new: orderQuantityMaximum };
-          productChanges.custom_fields = { new: customFields };
-          productChanges.upc = { new: upc };
-          productChanges.mpn = { new: mpn };
-
-          const productId = await ctx.db.insert("products", {
+          const createPayload: Record<string, any> = {
             ...(externalId ? { external_product_id: externalId } : {}),
             name,
-            description,
-            brand,
-            status,
-            is_visible: isVisible,
-            availability,
-            allow_purchases: allowPurchases,
-            availability_description: availabilityDescription,
-            condition,
-            is_condition_shown: isConditionShown,
-            default_price: price,
-            cost_price: costPrice,
-            retail_price: retailPrice,
-            sale_price: salePrice,
-            weight,
-            width,
-            height,
-            depth,
-            inventory_warning_level: inventoryWarningLevel,
-            page_title: pageTitle,
-            meta_keywords: metaKeywords,
-            meta_description: metaDescription,
-            sort_order: sortOrder,
-            search_keywords: searchKeywords,
-            category_string: categoryString,
-            category_ids: categoryIds,
-            warranty,
-            is_free_shipping: isFreeShipping,
-            fixed_cost_shipping_price: fixedCostShippingPrice,
-            order_quantity_minimum: orderQuantityMinimum,
-            order_quantity_maximum: orderQuantityMaximum,
-            custom_fields: customFields,
-            upc,
-            mpn,
-            sync_needed: 1, created_at: new Date().toISOString(), updated_at: new Date().toISOString()
-          });
+            status: status ?? 'inactive',
+            is_visible: isVisible ?? 0,
+            default_price: price ?? 0,
+            sync_needed: 1,
+            created_at: now,
+            updated_at: now,
+          };
+
+          const assignCreateField = (column: string, field: string, nextValue: unknown) => {
+            if (!hasColumn(row, column)) {
+              return;
+            }
+
+            createPayload[field] = nextValue;
+            productChanges[field] = { new: nextValue };
+          };
+
+          productChanges.name = { new: name };
+          productChanges.status = { new: createPayload.status };
+          productChanges.is_visible = { new: createPayload.is_visible };
+          productChanges.default_price = { new: createPayload.default_price };
+
+          assignCreateField('Description', 'description', description);
+          assignCreateField('Brand', 'brand', brand);
+          assignCreateField('Cost Price', 'cost_price', costPrice);
+          assignCreateField('Retail Price', 'retail_price', retailPrice);
+          assignCreateField('Sale Price', 'sale_price', salePrice);
+          assignCreateField('Weight', 'weight', weight);
+          assignCreateField('Width', 'width', width);
+          assignCreateField('Height', 'height', height);
+          assignCreateField('Depth', 'depth', depth);
+          assignCreateField('Page Title', 'page_title', pageTitle);
+          assignCreateField('Meta Keywords', 'meta_keywords', metaKeywords);
+          assignCreateField('Meta Description', 'meta_description', metaDescription);
+          assignCreateField('Sort Order', 'sort_order', sortOrder);
+          assignCreateField('Search Keywords', 'search_keywords', searchKeywords);
+          assignCreateField('Product Condition', 'condition', condition);
+          assignCreateField('Show Product Condition', 'is_condition_shown', isConditionShown);
+          assignCreateField('Allow Purchases', 'allow_purchases', allowPurchases);
+          assignCreateField('Allow Purchases', 'availability', availability);
+          assignCreateField('Product Availability', 'availability_description', availabilityDescription);
+          assignCreateField('Low Stock Level', 'inventory_warning_level', inventoryWarningLevel);
+          assignCreateField('Category String', 'category_string', categoryString);
+          assignCreateField('Category Details', 'category_ids', categoryIds);
+          assignCreateField('Warranty', 'warranty', warranty);
+          assignCreateField('Free Shipping', 'is_free_shipping', isFreeShipping);
+          assignCreateField('Fixed Shipping Price', 'fixed_cost_shipping_price', fixedCostShippingPrice);
+          assignCreateField('Minimum Purchase Quantity', 'order_quantity_minimum', orderQuantityMinimum);
+          assignCreateField('Maximum Purchase Quantity', 'order_quantity_maximum', orderQuantityMaximum);
+          assignCreateField('Product Custom Fields', 'custom_fields', customFields);
+          assignCreateField('Product Images', 'images', productImages);
+          if (!hasColumn(row, 'Product Images') && productImages !== undefined) {
+            createPayload.images = productImages;
+            productChanges.images = { new: productImages };
+          }
+          assignCreateField('Product UPC/EAN', 'upc', upc);
+          assignCreateField('Manufacturer Part Number', 'mpn', mpn);
+
+          const productId = await ctx.db.insert("products", createPayload as any);
           product = await ctx.db.get(productId);
           if (!product) {
             throw new Error('Created product could not be reloaded');
@@ -489,8 +653,8 @@ export const processRecords = internalMutation({
             status: "pending",
             attempts: 0,
             payload: JSON.stringify(productChanges),
-            created_at: new Date().toISOString(),
-            updated_at: new Date().toISOString()
+            created_at: now,
+            updated_at: now
           });
         }
 
@@ -498,30 +662,50 @@ export const processRecords = internalMutation({
           let variant = await ctx.db.query("variants").withIndex("by_sku", q => q.eq("sku", sku)).first();
           const variantChanges: Record<string, any> = {};
           let variantAction = 'create';
+          const variantPrice = price ?? product?.default_price ?? 0;
+          const nextInventoryLevel = inventoryLevel ?? 0;
+          const variantFieldsProvided = hasColumn(row, 'Price') || hasColumn(row, 'Stock Level');
 
           if (variant) {
             variantAction = 'update';
             if (variant.product_id !== productIdentifier) {
               throw new Error(`SKU ${sku} is already linked to another product.`);
             }
-            if (variant.price !== price) variantChanges.price = { old: variant.price, new: price };
-            if (variant.inventory_level !== inventoryLevel) variantChanges.inventory_level = { old: variant.inventory_level, new: inventoryLevel };
-            
-            await ctx.db.patch(variant._id, {
-              product_id: productIdentifier, price, inventory_level: inventoryLevel, sync_needed: 1, updated_at: new Date().toISOString()
-            });
+            const variantPatch: Record<string, any> = {
+              product_id: productIdentifier,
+              sync_needed: 1,
+              updated_at: now,
+            };
+
+            if (hasColumn(row, 'Price') && variant.price !== variantPrice) {
+              variantChanges.price = { old: variant.price, new: variantPrice };
+              variantPatch.price = variantPrice;
+            }
+
+            if (hasColumn(row, 'Stock Level') && variant.inventory_level !== nextInventoryLevel) {
+              variantChanges.inventory_level = { old: variant.inventory_level, new: nextInventoryLevel };
+              variantPatch.inventory_level = nextInventoryLevel;
+            }
+
+            if (Object.keys(variantChanges).length > 0) {
+              await ctx.db.patch(variant._id, variantPatch);
+            }
           } else {
-            variantChanges.price = { new: price };
-            variantChanges.inventory_level = { new: inventoryLevel };
+            if (hasColumn(row, 'Price')) {
+              variantChanges.price = { new: variantPrice };
+            }
+            if (hasColumn(row, 'Stock Level')) {
+              variantChanges.inventory_level = { new: nextInventoryLevel };
+            }
 
             await ctx.db.insert("variants", {
               product_id: productIdentifier,
-              sku, price, inventory_level: inventoryLevel, sync_needed: 1,
-              created_at: new Date().toISOString(), updated_at: new Date().toISOString()
+              sku, price: variantPrice, inventory_level: nextInventoryLevel, sync_needed: 1,
+              created_at: now, updated_at: now
             });
           }
 
-          if (Object.keys(variantChanges).length > 0) {
+          if (variantFieldsProvided && Object.keys(variantChanges).length > 0) {
             await ctx.db.insert("sync_queue", {
               entity_type: "variant",
               internal_id: sku,
@@ -529,8 +713,8 @@ export const processRecords = internalMutation({
               status: "pending",
               attempts: 0,
               payload: JSON.stringify(variantChanges),
-              created_at: new Date().toISOString(),
-              updated_at: new Date().toISOString()
+              created_at: now,
+              updated_at: now
             });
           }
         }

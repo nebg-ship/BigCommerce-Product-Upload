@@ -4,6 +4,8 @@ import { UploadCloud, FileText, CheckCircle2, AlertCircle, ChevronDown, ChevronU
 import { useQuery, useAction } from "convex/react";
 import { api } from "../../convex/_generated/api";
 
+const NON_SELECTABLE_UPDATE_HEADERS = new Set(['Product ID', 'Code', 'Item Type']);
+
 export default function Imports() {
   const imports = useQuery(api.imports.getImports);
   const processCsv = useAction(api.importActions.processCsvAction);
@@ -12,7 +14,53 @@ export default function Imports() {
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [expandedImport, setExpandedImport] = useState<string | null>(null);
   const [importType, setImportType] = useState<'update' | 'delete'>('update');
+  const [pendingUpload, setPendingUpload] = useState<{
+    content: string;
+    filename: string;
+    selectableHeaders: string[];
+  } | null>(null);
+  const [selectedFields, setSelectedFields] = useState<string[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const resetPendingUpload = () => {
+    setPendingUpload(null);
+    setSelectedFields([]);
+  };
+
+  const handleImportTypeChange = (nextImportType: 'update' | 'delete') => {
+    setImportType(nextImportType);
+    setUploadError(null);
+    resetPendingUpload();
+    if (fileInputRef.current) {
+      fileInputRef.current.value = '';
+    }
+  };
+
+  const processUpload = async (filename: string, content: string, fields?: string[]) => {
+    setUploading(true);
+    setUploadError(null);
+
+    try {
+      const res = await processCsv({
+        filename,
+        content,
+        importType,
+        selectedFields: importType === 'update' ? fields : undefined,
+      });
+      if (!res.success) {
+        setUploadError('Upload failed');
+        return;
+      }
+
+      resetPendingUpload();
+    } catch (err: any) {
+      console.error(err);
+      setUploadError(err.message || 'Upload error occurred while sending data.');
+    } finally {
+      setUploading(false);
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    }
+  };
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -20,6 +68,7 @@ export default function Imports() {
 
     setUploading(true);
     setUploadError(null);
+    resetPendingUpload();
     const reader = new FileReader();
     reader.onload = async (event) => {
       const content = event.target?.result as string;
@@ -27,8 +76,8 @@ export default function Imports() {
       const firstLine = content.split(/\r?\n/)[0];
       const headers = firstLine.split(',').map((h) => h.trim().replace(/^"|"$/g, ''));
       const requiredHeaders = importType === 'update'
-        ? ['Item Type', 'Name', 'Price']
-        : ['Item Type', 'Product ID'];
+        ? ['Product ID']
+        : ['Product ID'];
       const missingHeaders = requiredHeaders.filter((h) => !headers.includes(h));
 
       if (missingHeaders.length > 0) {
@@ -38,20 +87,37 @@ export default function Imports() {
         return;
       }
 
-      try {
-        const res = await processCsv({ filename: file.name, content, importType });
-        if (!res.success) {
-          setUploadError('Upload failed');
+      if (importType === 'update') {
+        const selectableHeaders = headers.filter((header) => !NON_SELECTABLE_UPDATE_HEADERS.has(header));
+        if (selectableHeaders.length === 0) {
+          setUploadError('No updateable fields were found in this CSV.');
+          setUploading(false);
+          if (fileInputRef.current) fileInputRef.current.value = '';
+          return;
         }
-      } catch (err: any) {
-        console.error(err);
-        setUploadError(err.message || 'Upload error occurred while sending data.');
-      } finally {
+
+        setPendingUpload({
+          content,
+          filename: file.name,
+          selectableHeaders,
+        });
+        setSelectedFields(selectableHeaders);
         setUploading(false);
         if (fileInputRef.current) fileInputRef.current.value = '';
+        return;
       }
+
+      await processUpload(file.name, content);
     };
     reader.readAsText(file);
+  };
+
+  const toggleSelectedField = (field: string) => {
+    setSelectedFields((currentFields) => (
+      currentFields.includes(field)
+        ? currentFields.filter((currentField) => currentField !== field)
+        : [...currentFields, field]
+    ));
   };
 
   const renderErrors = (errorsStr: string | null | undefined) => {
@@ -104,7 +170,7 @@ export default function Imports() {
               name="importType"
               value="update"
               checked={importType === 'update'}
-              onChange={() => setImportType('update')}
+              onChange={() => handleImportTypeChange('update')}
               className="w-4 h-4 text-emerald-600 focus:ring-emerald-500"
             />
             <span className="text-sm font-medium text-zinc-900">Update Products</span>
@@ -115,7 +181,7 @@ export default function Imports() {
               name="importType"
               value="delete"
               checked={importType === 'delete'}
-              onChange={() => setImportType('delete')}
+              onChange={() => handleImportTypeChange('delete')}
               className="w-4 h-4 text-red-600 focus:ring-red-500"
             />
             <span className="text-sm font-medium text-zinc-900">Delete Products</span>
@@ -147,10 +213,74 @@ export default function Imports() {
           </h3>
           <p className="text-zinc-500 text-sm max-w-md mx-auto">
             {importType === 'delete'
-              ? 'Drag and drop your CSV here. The file must contain at least "Item Type" and "Product ID" columns. Products found in the CSV will be deleted.'
-              : 'Drag and drop your catalog CSV here. "Product ID" is optional for brand-new products, and "Code" is optional if the row has no variant SKU.'}
+              ? 'Drag and drop your CSV here. The file must contain at least "Product ID". Products found in the CSV will be deleted.'
+              : 'Drag and drop your catalog CSV here. After upload, pick the fields you want to update. "Product ID" or "Code" is used to match existing products. "Item Type" is optional if present. Use "Product Images" as JSON, or the single-image columns "Image URL", "Image Description", "Image Sort Order", and "Image Is Thumbnail".'}
           </p>
         </div>
+
+        {pendingUpload && importType === 'update' && (
+          <div className="mt-6 rounded-2xl border border-zinc-200 bg-zinc-50 p-6 space-y-4">
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <h4 className="text-base font-medium text-zinc-900">Choose Fields To Update</h4>
+                <p className="text-sm text-zinc-500 mt-1">
+                  {pendingUpload.filename} loaded. Product matching still uses `Product ID` or `Code` automatically.
+                </p>
+              </div>
+              <div className="text-sm text-zinc-500">
+                {selectedFields.length} of {pendingUpload.selectableHeaders.length} selected
+              </div>
+            </div>
+
+            <div className="flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={() => setSelectedFields(pendingUpload.selectableHeaders)}
+                className="px-3 py-1.5 rounded-lg border border-zinc-300 bg-white text-sm font-medium text-zinc-700 hover:bg-zinc-100"
+              >
+                Select All
+              </button>
+              <button
+                type="button"
+                onClick={() => setSelectedFields([])}
+                className="px-3 py-1.5 rounded-lg border border-zinc-300 bg-white text-sm font-medium text-zinc-700 hover:bg-zinc-100"
+              >
+                Clear All
+              </button>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              {pendingUpload.selectableHeaders.map((header) => (
+                <label
+                  key={header}
+                  className="flex items-center gap-3 rounded-xl border border-zinc-200 bg-white px-4 py-3 cursor-pointer hover:border-zinc-300"
+                >
+                  <input
+                    type="checkbox"
+                    checked={selectedFields.includes(header)}
+                    onChange={() => toggleSelectedField(header)}
+                    className="w-4 h-4 text-emerald-600 rounded border-zinc-300 focus:ring-emerald-500"
+                  />
+                  <span className="text-sm font-medium text-zinc-800">{header}</span>
+                </label>
+              ))}
+            </div>
+
+            <div className="flex items-center justify-between gap-4">
+              <p className="text-xs text-zinc-500">
+                Helper columns such as `Product ID`, `Code`, and `Image URL` are still used automatically when needed.
+              </p>
+              <button
+                type="button"
+                onClick={() => processUpload(pendingUpload.filename, pendingUpload.content, selectedFields)}
+                disabled={uploading || selectedFields.length === 0}
+                className="px-4 py-2 rounded-lg bg-zinc-900 text-white text-sm font-medium hover:bg-zinc-800 disabled:opacity-50"
+              >
+                {uploading ? 'Processing CSV...' : 'Process Selected Fields'}
+              </button>
+            </div>
+          </div>
+        )}
       </div>
 
       <div className="bg-white rounded-xl shadow-sm border border-zinc-200 overflow-hidden">

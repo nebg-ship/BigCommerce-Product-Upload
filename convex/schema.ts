@@ -41,6 +41,12 @@ export default defineSchema({
       name: v.string(),
       value: v.string(),
     }))),
+    images: v.optional(v.array(v.object({
+      image_url: v.string(),
+      description: v.optional(v.string()),
+      is_thumbnail: v.optional(v.boolean()),
+      sort_order: v.optional(v.number()),
+    }))),
     version: v.optional(v.number()),
     sync_needed: v.number(),
     updated_at: v.string(),

@@ -4,7 +4,7 @@ import { v } from "convex/values";
 import { internal } from "./_generated/api";
 
 const DEFAULT_PULL_CHANNEL_NAME = "Bonsai Outlet";
-const BIGCOMMERCE_PAGE_SIZE = 50;
+const BIGCOMMERCE_PAGE_SIZE = 250;
 const PAGES_PER_PULL_CALL = 5;
 
 type BigCommerceCredentials = {
@@ -24,6 +24,20 @@ type BigCommerceChannelsResponse = {
 type BigCommerceCustomField = {
   name?: string | null;
   value?: string | null;
+};
+
+type BigCommerceImage = {
+  description?: string | null;
+  image_file?: string | null;
+  image_url?: string | null;
+  is_thumbnail?: boolean | null;
+  sort_order?: number | null;
+  standard_url?: string | null;
+  thumbnail_url?: string | null;
+  url_standard?: string | null;
+  url_thumbnail?: string | null;
+  url_zoom?: string | null;
+  zoom_url?: string | null;
 };
 
 type BigCommerceProduct = {
@@ -48,6 +62,7 @@ type BigCommerceProduct = {
   order_quantity_minimum?: number | null;
   description?: string;
   brand_id?: number | null;
+  images?: BigCommerceImage[] | null;
   is_visible?: boolean;
   page_title?: string | null;
   price?: number;
@@ -174,6 +189,55 @@ function toCustomFields(value: BigCommerceCustomField[] | null | undefined) {
   return [...entries.entries()]
     .sort(([leftName], [rightName]) => leftName.localeCompare(rightName))
     .map(([name, fieldValue]) => ({ name, value: fieldValue }));
+}
+
+function normalizeImageUrl(value: unknown): string | undefined {
+  return toOptionalString(value);
+}
+
+function toImages(value: BigCommerceImage[] | null | undefined) {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+
+  const entries = new Map<string, {
+    image_url: string;
+    description?: string;
+    is_thumbnail?: boolean;
+    sort_order?: number;
+  }>();
+
+  for (const image of value) {
+    const imageUrl = normalizeImageUrl(
+      image?.image_url ??
+      image?.standard_url ??
+      image?.url_standard ??
+      image?.zoom_url ??
+      image?.url_zoom ??
+      image?.thumbnail_url ??
+      image?.url_thumbnail ??
+      image?.image_file,
+    );
+    if (!imageUrl) {
+      continue;
+    }
+
+    entries.set(imageUrl, {
+      image_url: imageUrl,
+      description: toOptionalString(image?.description),
+      is_thumbnail: typeof image?.is_thumbnail === "boolean" ? image.is_thumbnail : undefined,
+      sort_order: toOptionalInteger(image?.sort_order),
+    });
+  }
+
+  return [...entries.values()].sort((left, right) => {
+    const sortDifference = (left.sort_order ?? 0) - (right.sort_order ?? 0);
+    return sortDifference !== 0 ? sortDifference : left.image_url.localeCompare(right.image_url);
+  });
+}
+
+function areArraysEqual<T>(left: T[] | undefined, right: T[] | undefined) {
+  return JSON.stringify(left ?? []) === JSON.stringify(right ?? []);
 }
 
 async function readBigCommerceError(response: Response): Promise<string> {
@@ -326,47 +390,69 @@ export const pullFromBigCommerce = action({
         }
       }
 
-      let currentPage = Math.max(args.page ?? 1, 1);
-      let totalPages: number | null = null;
-      let totalCount = 0;
+      const currentPage = Math.max(args.page ?? 1, 1);
+      let nextPageToPull = currentPage;
+      let lastProcessedPage = currentPage;
       let processedPages = 0;
       let pulledCount = 0;
+      let totalCount = 0;
+      let totalPages = currentPage;
+      let insertedProducts = 0;
+      let updatedProducts = 0;
+      let unchangedProducts = 0;
+      let insertedVariants = 0;
+      let updatedVariants = 0;
+      let unchangedVariants = 0;
 
       while (processedPages < PAGES_PER_PULL_CALL) {
         const response = await bigCommerceGet<BigCommerceProductsResponse>(credentials, "/v3/catalog/products", {
           "channel_id:in": channelId,
-          include: "variants,custom_fields",
+          include: "variants,custom_fields,images",
           limit: String(BIGCOMMERCE_PAGE_SIZE),
-          page: String(currentPage),
+          page: String(nextPageToPull),
         });
 
         const products = response.data || [];
-        totalPages = response.meta?.pagination?.total_pages || currentPage;
+        totalPages = response.meta?.pagination?.total_pages || nextPageToPull;
         totalCount = response.meta?.pagination?.total || 0;
 
-        await ctx.runMutation(internal.bigcommerce.savePulledProducts, {
+        const saveResult = await ctx.runMutation(internal.bigcommerce.savePulledProducts, {
           products: JSON.stringify(products)
         });
 
         pulledCount += products.length;
+        insertedProducts += saveResult.insertedProducts;
+        updatedProducts += saveResult.updatedProducts;
+        unchangedProducts += saveResult.unchangedProducts;
+        insertedVariants += saveResult.insertedVariants;
+        updatedVariants += saveResult.updatedVariants;
+        unchangedVariants += saveResult.unchangedVariants;
         processedPages += 1;
-        if (currentPage >= totalPages) {
-          currentPage += 1;
+        lastProcessedPage = nextPageToPull;
+
+        if (nextPageToPull >= totalPages) {
           break;
         }
-        currentPage += 1;
+
+        nextPageToPull += 1;
       }
 
       return {
         success: true,
         channelName: channelLabel,
         count: pulledCount,
-        currentPage: Math.max(args.page ?? 1, 1),
-        lastProcessedPage: currentPage - 1,
-        nextPage: totalPages !== null && currentPage <= totalPages ? currentPage : null,
+        currentPage,
+        lastProcessedPage,
+        nextPage: lastProcessedPage < totalPages ? lastProcessedPage + 1 : null,
         processedPages,
         totalCount,
-        totalPages: totalPages ?? 0,
+        totalPages,
+        insertedProducts,
+        updatedProducts,
+        unchangedProducts,
+        insertedVariants,
+        updatedVariants,
+        unchangedVariants,
       };
     } catch (err: any) {
       console.error('BigCommerce Pull Error:', err);
@@ -392,6 +478,12 @@ export const savePulledProducts = internalMutation({
   args: { products: v.string() },
   handler: async (ctx, args) => {
     const products = JSON.parse(args.products);
+    let insertedProducts = 0;
+    let updatedProducts = 0;
+    let unchangedProducts = 0;
+    let insertedVariants = 0;
+    let updatedVariants = 0;
+    let unchangedVariants = 0;
 
     for (const p of products) {
       const externalId = p.id.toString();
@@ -428,45 +520,88 @@ export const savePulledProducts = internalMutation({
       const mpn = toOptionalString(p.mpn);
       const categoryIds = toCategoryIds(p.categories);
       const customFields = toCustomFields(p.custom_fields);
+      const images = toImages(p.images);
 
       let product = await ctx.db.query("products").withIndex("by_external_id", q => q.eq("external_product_id", externalId)).first();
       if (product) {
-        await ctx.db.patch(product._id, {
-          name,
-          description,
-          brand,
-          status,
-          is_visible: isVisible,
-          availability,
-          allow_purchases: allowPurchases,
-          availability_description: availabilityDescription,
-          condition,
-          is_condition_shown: isConditionShown,
-          default_price: defaultPrice,
-          cost_price: costPrice,
-          retail_price: retailPrice,
-          sale_price: salePrice,
-          weight,
-          width,
-          height,
-          depth,
-          inventory_warning_level: inventoryWarningLevel,
-          is_free_shipping: isFreeShipping,
-          fixed_cost_shipping_price: fixedCostShippingPrice,
-          order_quantity_minimum: orderQuantityMinimum,
-          order_quantity_maximum: orderQuantityMaximum,
-          page_title: pageTitle,
-          meta_keywords: metaKeywords,
-          meta_description: metaDescription,
-          sort_order: sortOrder,
-          search_keywords: searchKeywords,
-          warranty,
-          custom_fields: customFields,
-          upc,
-          mpn,
-          category_ids: categoryIds,
-          sync_needed: 0, updated_at: new Date().toISOString()
-        });
+        const hasProductChanges =
+          product.name !== name ||
+          product.description !== description ||
+          product.brand !== brand ||
+          product.status !== status ||
+          product.is_visible !== isVisible ||
+          product.availability !== availability ||
+          product.allow_purchases !== allowPurchases ||
+          product.availability_description !== availabilityDescription ||
+          product.condition !== condition ||
+          product.is_condition_shown !== isConditionShown ||
+          product.default_price !== defaultPrice ||
+          product.cost_price !== costPrice ||
+          product.retail_price !== retailPrice ||
+          product.sale_price !== salePrice ||
+          product.weight !== weight ||
+          product.width !== width ||
+          product.height !== height ||
+          product.depth !== depth ||
+          product.inventory_warning_level !== inventoryWarningLevel ||
+          product.is_free_shipping !== isFreeShipping ||
+          product.fixed_cost_shipping_price !== fixedCostShippingPrice ||
+          product.order_quantity_minimum !== orderQuantityMinimum ||
+          product.order_quantity_maximum !== orderQuantityMaximum ||
+          product.page_title !== pageTitle ||
+          product.meta_keywords !== metaKeywords ||
+          product.meta_description !== metaDescription ||
+          product.sort_order !== sortOrder ||
+          product.search_keywords !== searchKeywords ||
+          product.warranty !== warranty ||
+          product.upc !== upc ||
+          product.mpn !== mpn ||
+          !areArraysEqual(product.images, images) ||
+          !areArraysEqual(product.category_ids, categoryIds) ||
+          !areArraysEqual(product.custom_fields, customFields);
+
+        if (hasProductChanges) {
+          await ctx.db.patch(product._id, {
+            name,
+            description,
+            brand,
+            status,
+            is_visible: isVisible,
+            availability,
+            allow_purchases: allowPurchases,
+            availability_description: availabilityDescription,
+            condition,
+            is_condition_shown: isConditionShown,
+            default_price: defaultPrice,
+            cost_price: costPrice,
+            retail_price: retailPrice,
+            sale_price: salePrice,
+            weight,
+            width,
+            height,
+            depth,
+            inventory_warning_level: inventoryWarningLevel,
+            is_free_shipping: isFreeShipping,
+            fixed_cost_shipping_price: fixedCostShippingPrice,
+            order_quantity_minimum: orderQuantityMinimum,
+            order_quantity_maximum: orderQuantityMaximum,
+            page_title: pageTitle,
+            meta_keywords: metaKeywords,
+            meta_description: metaDescription,
+            sort_order: sortOrder,
+            search_keywords: searchKeywords,
+            warranty,
+            custom_fields: customFields,
+            images,
+            upc,
+            mpn,
+            category_ids: categoryIds,
+            sync_needed: 0, updated_at: new Date().toISOString()
+          });
+          updatedProducts += 1;
+        } else {
+          unchangedProducts += 1;
+        }
       } else {
         await ctx.db.insert("products", {
           external_product_id: externalId,
@@ -500,11 +635,13 @@ export const savePulledProducts = internalMutation({
           search_keywords: searchKeywords,
           warranty,
           custom_fields: customFields,
+          images,
           upc,
           mpn,
           category_ids: categoryIds,
           sync_needed: 0, created_at: new Date().toISOString(), updated_at: new Date().toISOString()
         });
+        insertedProducts += 1;
       }
 
       if (p.variants) {
@@ -515,18 +652,39 @@ export const savePulledProducts = internalMutation({
 
           let variant = await ctx.db.query("variants").withIndex("by_sku", q => q.eq("sku", sku)).first();
           if (variant) {
-            await ctx.db.patch(variant._id, {
-              price, inventory_level: inventoryLevel, sync_needed: 0, updated_at: new Date().toISOString()
-            });
+            const hasVariantChanges =
+              variant.product_id !== externalId ||
+              variant.price !== price ||
+              variant.inventory_level !== inventoryLevel;
+
+            if (hasVariantChanges) {
+              await ctx.db.patch(variant._id, {
+                product_id: externalId,
+                price, inventory_level: inventoryLevel, sync_needed: 0, updated_at: new Date().toISOString()
+              });
+              updatedVariants += 1;
+            } else {
+              unchangedVariants += 1;
+            }
           } else {
             await ctx.db.insert("variants", {
               product_id: externalId,
               sku, price, inventory_level: inventoryLevel, sync_needed: 0,
               created_at: new Date().toISOString(), updated_at: new Date().toISOString()
             });
+            insertedVariants += 1;
           }
         }
       }
     }
+
+    return {
+      insertedProducts,
+      updatedProducts,
+      unchangedProducts,
+      insertedVariants,
+      updatedVariants,
+      unchangedVariants,
+    };
   }
 });

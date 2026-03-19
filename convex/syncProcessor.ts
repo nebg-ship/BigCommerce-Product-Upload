@@ -55,8 +55,27 @@ type BigCommerceCustomField = {
   value?: string | null;
 };
 
+type BigCommerceImage = {
+  description?: string | null;
+  id: number;
+  image_file?: string | null;
+  image_url?: string | null;
+  is_thumbnail?: boolean | null;
+  sort_order?: number | null;
+  standard_url?: string | null;
+  thumbnail_url?: string | null;
+  url_standard?: string | null;
+  url_thumbnail?: string | null;
+  url_zoom?: string | null;
+  zoom_url?: string | null;
+};
+
 type BigCommerceCustomFieldListResponse = {
   data?: BigCommerceCustomField[] | null;
+};
+
+type BigCommerceImageListResponse = {
+  data?: BigCommerceImage[] | null;
 };
 
 type BigCommerceOptionValue = {
@@ -268,6 +287,43 @@ function getProductAvailability(product: ProductRecord): string {
   }
 
   return "available";
+}
+
+function normalizeImageUrl(value: string | null | undefined): string | null {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : null;
+}
+
+function normalizeLocalImages(images: ProductRecord["images"] | undefined) {
+  if (images === undefined) {
+    return undefined;
+  }
+
+  const normalizedImages = new Map<string, {
+    image_url: string;
+    description?: string;
+    is_thumbnail?: boolean;
+    sort_order?: number;
+  }>();
+
+  for (const image of images ?? []) {
+    const imageUrl = normalizeImageUrl(image.image_url);
+    if (!imageUrl) {
+      continue;
+    }
+
+    normalizedImages.set(imageUrl, {
+      image_url: imageUrl,
+      description: image.description?.trim() || undefined,
+      is_thumbnail: typeof image.is_thumbnail === "boolean" ? image.is_thumbnail : undefined,
+      sort_order: image.sort_order,
+    });
+  }
+
+  return [...normalizedImages.values()].sort((left, right) => {
+    const sortDifference = (left.sort_order ?? 0) - (right.sort_order ?? 0);
+    return sortDifference !== 0 ? sortDifference : left.image_url.localeCompare(right.image_url);
+  });
 }
 
 function buildProductUpdatePayload(product: ProductRecord, changedFields?: Set<string>) {
@@ -495,6 +551,15 @@ async function fetchRemoteCustomFields(client: BigCommerceClient, productId: str
   return response?.data ?? [];
 }
 
+async function fetchRemoteImages(client: BigCommerceClient, productId: string) {
+  const response = await bigCommerceRequest<BigCommerceImageListResponse>(
+    client,
+    `/v3/catalog/products/${productId}/images?limit=250`,
+  );
+
+  return response?.data ?? [];
+}
+
 async function syncRemoteCustomFields(
   client: BigCommerceClient,
   productId: string,
@@ -570,6 +635,101 @@ async function syncRemoteCustomFields(
       await bigCommerceRequest(
         client,
         `/v3/catalog/products/${productId}/custom-fields/${remoteField.id}`,
+        { method: "DELETE" },
+      );
+    }
+  }
+}
+
+async function syncRemoteImages(
+  client: BigCommerceClient,
+  productId: string,
+  localImages: ProductRecord["images"] | undefined,
+) {
+  if (localImages === undefined) {
+    return;
+  }
+
+  const normalizedLocalImages = normalizeLocalImages(localImages) ?? [];
+  const remoteImages = await fetchRemoteImages(client, productId);
+  const remoteImagesByUrl = new Map<string, BigCommerceImage[]>();
+
+  for (const remoteImage of remoteImages) {
+    const imageUrl = normalizeImageUrl(
+      remoteImage.image_url ??
+      remoteImage.standard_url ??
+      remoteImage.url_standard ??
+      remoteImage.zoom_url ??
+      remoteImage.url_zoom ??
+      remoteImage.thumbnail_url ??
+      remoteImage.url_thumbnail ??
+      remoteImage.image_file,
+    );
+    if (!imageUrl) {
+      continue;
+    }
+
+    const existing = remoteImagesByUrl.get(imageUrl) ?? [];
+    existing.push(remoteImage);
+    remoteImagesByUrl.set(imageUrl, existing);
+  }
+
+  for (const localImage of normalizedLocalImages) {
+    const remoteEntries = remoteImagesByUrl.get(localImage.image_url) ?? [];
+    const [matchedRemoteImage, ...duplicateRemoteImages] = remoteEntries;
+
+    if (!matchedRemoteImage) {
+      await bigCommerceRequest(
+        client,
+        `/v3/catalog/products/${productId}/images`,
+        {
+          body: JSON.stringify({
+            image_url: localImage.image_url,
+            description: localImage.description ?? "",
+            is_thumbnail: localImage.is_thumbnail ?? false,
+            sort_order: localImage.sort_order ?? 0,
+          }),
+          method: "POST",
+        },
+      );
+      continue;
+    }
+
+    if (
+      (matchedRemoteImage.description ?? "") !== (localImage.description ?? "") ||
+      (matchedRemoteImage.is_thumbnail ?? false) !== (localImage.is_thumbnail ?? false) ||
+      (matchedRemoteImage.sort_order ?? 0) !== (localImage.sort_order ?? 0)
+    ) {
+      await bigCommerceRequest(
+        client,
+        `/v3/catalog/products/${productId}/images/${matchedRemoteImage.id}`,
+        {
+          body: JSON.stringify({
+            description: localImage.description ?? "",
+            is_thumbnail: localImage.is_thumbnail ?? false,
+            sort_order: localImage.sort_order ?? 0,
+          }),
+          method: "PUT",
+        },
+      );
+    }
+
+    for (const duplicateRemoteImage of duplicateRemoteImages) {
+      await bigCommerceRequest(
+        client,
+        `/v3/catalog/products/${productId}/images/${duplicateRemoteImage.id}`,
+        { method: "DELETE" },
+      );
+    }
+
+    remoteImagesByUrl.delete(localImage.image_url);
+  }
+
+  for (const obsoleteRemoteImages of remoteImagesByUrl.values()) {
+    for (const remoteImage of obsoleteRemoteImages) {
+      await bigCommerceRequest(
+        client,
+        `/v3/catalog/products/${productId}/images/${remoteImage.id}`,
         { method: "DELETE" },
       );
     }
@@ -828,6 +988,7 @@ async function processProductJob(ctx: any, client: BigCommerceClient, job: SyncJ
     const createdProduct = await createRemoteProduct(client, snapshot);
     const newExternalProductId = createdProduct.id.toString();
     await syncRemoteCustomFields(client, newExternalProductId, product.custom_fields);
+    await syncRemoteImages(client, newExternalProductId, product.images);
     await ctx.runMutation(internal.syncProcessor.rebindCreatedProduct, {
       oldIdentifier: job.internal_id,
       productId: product._id,
@@ -848,6 +1009,10 @@ async function processProductJob(ctx: any, client: BigCommerceClient, job: SyncJ
 
   if (changedFields.has("custom_fields")) {
     await syncRemoteCustomFields(client, remoteProduct.id.toString(), product.custom_fields ?? []);
+  }
+
+  if (changedFields.has("images")) {
+    await syncRemoteImages(client, remoteProduct.id.toString(), product.images ?? []);
   }
 
   return { productId: product._id };

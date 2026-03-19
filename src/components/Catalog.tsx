@@ -5,6 +5,27 @@ import { Search, Filter, DownloadCloud, Loader2, Edit2, X, Trash2, AlertTriangle
 import { useQuery, useMutation, useAction, usePaginatedQuery } from "convex/react";
 import { api } from "../../convex/_generated/api";
 
+const CONVEX_CONNECTION_LOST_MESSAGE = 'Connection lost while action was in flight';
+const MAX_PULL_RETRIES = 3;
+const RETRY_DELAY_MS = 1500;
+
+function getErrorMessage(error: unknown) {
+  return error instanceof Error ? error.message : String(error ?? 'Unknown error');
+}
+
+function isRetriablePullError(error: unknown) {
+  const message = getErrorMessage(error).toLowerCase();
+  return (
+    message.includes(CONVEX_CONNECTION_LOST_MESSAGE.toLowerCase()) ||
+    message.includes('networkerror') ||
+    message.includes('failed to fetch')
+  );
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 export default function Catalog() {
   const stats = useQuery(api.products.getDashboardStats);
   const {
@@ -37,25 +58,58 @@ export default function Catalog() {
     setPullProgress('Starting BigCommerce pull...');
     try {
       let nextPage: number | null = 1;
-      let totalPulled = 0;
+      let totalProcessed = 0;
+      let totalInserted = 0;
+      let totalUpdated = 0;
+      let totalUnchanged = 0;
       let totalPages: number | null = null;
       let channelName = 'Bonsai Outlet';
 
       while (nextPage) {
-        const res = await pullFromBigCommerce({ page: nextPage });
-        totalPulled += res.count;
+        const pageToPull = nextPage;
+        let res;
+
+        for (let attempt = 1; attempt <= MAX_PULL_RETRIES; attempt += 1) {
+          try {
+            res = await pullFromBigCommerce({ page: pageToPull });
+            break;
+          } catch (err) {
+            if (!isRetriablePullError(err) || attempt === MAX_PULL_RETRIES) {
+              throw err;
+            }
+
+            setPullProgress(
+              `Connection dropped while pulling ${channelName}. Retrying page ${pageToPull} (${attempt + 1}/${MAX_PULL_RETRIES})...`,
+            );
+            await sleep(RETRY_DELAY_MS * attempt);
+          }
+        }
+
+        if (!res) {
+          throw new Error(`Failed to pull page ${pageToPull}.`);
+        }
+
+        totalProcessed += res.count;
+        totalInserted += res.insertedProducts;
+        totalUpdated += res.updatedProducts;
+        totalUnchanged += res.unchangedProducts;
         totalPages = res.totalPages;
         channelName = res.channelName;
         const pageRange = res.lastProcessedPage > res.currentPage
           ? `pages ${res.currentPage}-${res.lastProcessedPage}`
           : `page ${res.currentPage}`;
-        setPullProgress(`Pulling ${channelName}: ${pageRange}${res.totalPages ? ` of ${res.totalPages}` : ''}, ${totalPulled.toLocaleString()} products imported so far.`);
+        const remoteTotal = typeof res.totalCount === 'number' ? res.totalCount.toLocaleString() : null;
+        setPullProgress(
+          `Pulling ${channelName}: ${pageRange}${res.totalPages ? ` of ${res.totalPages}` : ''}. Processed ${totalProcessed.toLocaleString()}${remoteTotal ? ` of ${remoteTotal}` : ''} remote products; ${totalInserted.toLocaleString()} new, ${totalUpdated.toLocaleString()} updated, ${totalUnchanged.toLocaleString()} unchanged.`,
+        );
         nextPage = res.nextPage;
       }
 
-      alert(`Successfully pulled ${totalPulled.toLocaleString()} product${totalPulled === 1 ? '' : 's'} from BigCommerce channel "${channelName}".`);
+      alert(
+        `Finished pulling "${channelName}". Processed ${totalProcessed.toLocaleString()} remote product${totalProcessed === 1 ? '' : 's'}: ${totalInserted.toLocaleString()} new, ${totalUpdated.toLocaleString()} updated, ${totalUnchanged.toLocaleString()} unchanged.`,
+      );
     } catch (err: any) {
-      setPullError(err.message);
+      setPullError(getErrorMessage(err));
     } finally {
       setPullProgress(null);
       setPulling(false);
